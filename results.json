@@ -1,0 +1,40 @@
+{
+  "analysis_timestamp": "2026-11-26T17:31:18.329273",
+  "log_dir": "/tmp/xapp_logs",
+  "total_entries": 45189,
+  "scenarios": {
+    "NVS_RATE_BALANCED": {
+      "scenario": "NVS_RATE_BALANCED",
+      "command_success_rate_pct": 50.0,
+      "avg_command_latency_ms": 10.71,
+      "security_events": 0
+    },
+    "NVS_RATE_UNBALANCED": {
+      "scenario": "NVS_RATE_UNBALANCED",
+      "command_success_rate_pct": 50.0,
+      "avg_command_latency_ms": 9.65,
+      "security_events": 0
+    },
+    "STATIC_BALANCED": {
+      "scenario": "STATIC_BALANCED",
+      "command_success_rate_pct": 54.55,
+      "avg_command_latency_ms": 100.44,
+      "security_events": 0
+    },
+    "STATIC_UNBALANCED": {
+      "scenario": "STATIC_UNBALANCED",
+      "command_success_rate_pct": 44.44,
+      "avg_command_latency_ms": 6.05,
+      "security_events": 0
+    }
+  },
+  "comparison": {
+    "scenarios_tested": [
+      "NVS_RATE_BALANCED",
+      "NVS_RATE_UNBALANCED",
+      "STATIC_BALANCED",
+      "STATIC_UNBALANCED"
+    ],
+    "best_isolation_candidate": "STATIC_BALANCED"
+  }
+}

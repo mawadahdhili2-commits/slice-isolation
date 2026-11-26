@@ -262,7 +262,7 @@ class FlexRICAdapter:
         self.conn = None
         self.node_id = None
         self._cbs = []                          # keep callbacks alive (GC!)
-        self.ric.init(extra_argv)
+        self.ric.init()
         self.conn = self.ric.conn_e2_nodes()
         if len(self.conn) == 0:
             raise RuntimeError("No E2 node connected to the RIC (start RIC then gNB first)")
@@ -302,7 +302,7 @@ class FlexRICAdapter:
         mac, sl = MacCb(), SliceCb()
         self._cbs += [mac, sl]
         self.ric.report_mac_sm(self.node_id, self.ric.Interval_ms_10, mac)
-        self.ric.report_slice_sm(self.node_id, self.ric.Interval_ms_1000, sl)
+        self.ric.report_slice_sm(self.node_id, self.ric.Interval_ms_10, sl)
         self.log.info("Subscribed to MAC (RNTI discovery) and SLICE_STATS")
 
     @staticmethod
@@ -598,7 +598,7 @@ def load_sdk():
 def probe(ric):
     """Print the SDK names this xApp relies on, to validate them on your build."""
     needed = ["init", "conn_e2_nodes", "report_mac_sm", "report_slice_sm", "control_slice_sm",
-              "mac_cb", "slice_cb", "Interval_ms_10", "Interval_ms_1000",
+              "mac_cb", "slice_cb", "Interval_ms_10", "Interval_ms_10",
               "slice_ctrl_msg_t", "fr_slice_t", "slice_array", "ue_slice_assoc_t",
               "ue_slice_assoc_array", "del_dl_array",
               "SLICE_CTRL_SM_V0_ADD", "SLICE_CTRL_SM_V0_DEL", "SLICE_CTRL_SM_V0_UE_SLICE_ASSOC",

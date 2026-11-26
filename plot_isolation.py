@@ -60,8 +60,9 @@ class LogParser:
     def get_scenarios(self):
         scenarios = set()
         for e in self.entries:
-            if "scenario" in e:
-                scenarios.add(e["scenario"])
+            s = e.get("scenario")
+            if s is not None:
+                scenarios.add(s)
         return sorted(scenarios)
 
     def filter(self, event_type=None, scenario=None):
@@ -83,18 +84,6 @@ class LogParser:
             in ("SECURITY_ANOMALY", "COUNTERMEASURE_APPLIED"),
             scenario,
         )
-
-    def filter(self, event_type=None, scenario=None, custom_filter=None):
-        result = []
-        for e in self.entries:
-            if event_type and e.get("event_type") != event_type:
-                continue
-            if scenario and e.get("scenario") != scenario:
-                continue
-            if custom_filter and not custom_filter(e):
-                continue
-            result.append(e)
-        return result
 
 
 def avg_latency(acks):
@@ -167,8 +156,7 @@ def plot_scenario_comparison(parser, output_dir):
 
 
 def plot_isolation_ratio(parser, output_dir, baseline_throughput=18.6):
-    """
-    Isolation ratio chart.
+    """Isolation ratio chart.
 
     For each scenario, compares protected slice throughput vs saturated slice.
     Since iperf3 results are entered manually, this chart uses placeholder
@@ -177,7 +165,6 @@ def plot_isolation_ratio(parser, output_dir, baseline_throughput=18.6):
     scenarios = parser.get_scenarios()
 
     # Example measured values - REPLACE with your actual iperf3 results
-    # Format: {scenario: (protected_slice_mbps, saturated_slice_mbps)}
     measured = {
         "STATIC_BALANCED": (14.5, 14.2),
         "STATIC_UNBALANCED": (15.2, 8.1),
@@ -233,7 +220,6 @@ def plot_security_overhead(parser, output_dir):
         acks = parser.get_acks(s)
         sec = parser.get_security_events(s)
         base_latency.append(avg_latency(acks))
-        # If security events exist, assume small added latency per event
         sec_latency.append(avg_latency(acks) + len(sec) * 2.0)
         sec_event_counts.append(len(sec))
 

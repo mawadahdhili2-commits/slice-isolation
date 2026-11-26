@@ -21,6 +21,7 @@ import json
 import glob
 import os
 import argparse
+import statistics
 from datetime import datetime
 from pathlib import Path
 from collections import defaultdict
@@ -52,16 +53,19 @@ class LogParser:
     def get_scenarios(self):
         scenarios = set()
         for e in self.entries:
-            if "scenario" in e:
-                scenarios.add(e["scenario"])
+            s = e.get("scenario")
+            if s is not None:
+                scenarios.add(s)
         return sorted(scenarios)
 
-    def filter(self, event_type=None, scenario=None):
+    def filter(self, event_type=None, scenario=None, custom_filter=None):
         result = []
         for e in self.entries:
             if event_type and e.get("event_type") != event_type:
                 continue
             if scenario and e.get("scenario") != scenario:
+                continue
+            if custom_filter and not custom_filter(e):
                 continue
             result.append(e)
         return result
@@ -78,18 +82,6 @@ class LogParser:
             in ("SECURITY_ANOMALY", "COUNTERMEASURE_APPLIED"),
             scenario,
         )
-
-    def filter(self, event_type=None, scenario=None, custom_filter=None):
-        result = []
-        for e in self.entries:
-            if event_type and e.get("event_type") != event_type:
-                continue
-            if scenario and e.get("scenario") != scenario:
-                continue
-            if custom_filter and not custom_filter(e):
-                continue
-            result.append(e)
-        return result
 
 
 class IsolationAnalyzer:
@@ -146,9 +138,6 @@ class IsolationAnalyzer:
             "avg_command_latency_ms": self.avg_command_latency(scenario),
             "security_events": self.security_event_count(scenario),
         }
-
-
-import statistics  # noqa: E402  (moved here to keep class clean)
 
 
 def analyze_all(log_dir, output_path=None):
