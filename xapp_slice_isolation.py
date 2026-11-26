@@ -1,21 +1,25 @@
 #!/usr/bin/env python3
 """
-xApp Slice Isolation - Phase 2 Implementation
-==============================================
+xApp Slice Isolation - Phase 2 (v2, real FlexRIC SDK)
+=====================================================
 
-This xApp implements slice resource partitioning and isolation measurement
-for the O-RAN Near-RT RIC (FlexRIC) platform.
+Creates two slices (STATIC then NVS-RATE, balanced / unbalanced), attaches
+one UE per slice using the RNTI read from MAC reports, holds each
+configuration for a fixed duration (iperf3 window), compares the SLICE_STATS
+state reported by the gNB with the requested configuration, and logs
+everything with timestamps (JSONL + human-readable).
 
-Based on the reference xapp_slice_moni_ctrl.py from the testbed, this xApp:
-- Creates two slices with STATIC algorithm (balanced and unbalanced)
-- Associates each UE to a distinct slice using RNTI from KPM reports
-- Maintains each configuration for a fixed measurement duration
-- Logs all commands, ACKs, and observed states with timestamps
-- Extends to NVS-RATE algorithm for comparison
+IMPORTANT (why v2): v1 imported classes (XApp, E2Client) that do not exist in
+the FlexRIC SDK and silently fell back to mock classes, so no E2 message was
+ever sent. v2 uses the real SDK exactly like xapp_slice_moni_ctrl.py:
+    import xapp_sdk as ric
+    ric.init() / ric.conn_e2_nodes() / ric.report_*_sm() / ric.control_slice_sm()
+and FAILS LOUDLY if the SDK is missing (no silent mock).
 
-Author: Oueslati Ranim, Ben Hedhili Mawadda
-Project: Slice Isolation in NextG O-RAN Networks
-Date: November 2026
+All SDK-specific code lives in class FlexRICAdapter, so if a field name
+differs on your build, only that class needs a fix (see --probe).
+
+Authors: Oueslati Ranim, Ben Hedhili Mawadda
 """
 
 import sys
@@ -23,917 +27,619 @@ import time
 import json
 import logging
 import threading
-import signal
+import argparse
 from datetime import datetime
 from enum import Enum
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, asdict
 from typing import Optional, List, Dict, Any
 from pathlib import Path
 
 # =============================================================================
-# FLEXRIC PYTHON SDK IMPORTS
+# CONSTANTS
 # =============================================================================
-# The FlexRIC Python SDK is installed at /opt/flexric/python
-# It provides: xapp_sdk, e2ap, e2sm_kpm, e2sm_rc, e2sm_slice
-#
-# If running outside the testbed, these imports will fail.
-# The code is structured to be testable with mocks.
+DEFAULT_MEASUREMENT_DURATION = 30   # seconds, matches the 30 s iperf3 of Phase 1
+TOTAL_PRBS = 14                     # PRB indices 0..13 (testbed report)
+BASELINE_MBPS = 18.0                # receiver throughput without slicing (report)
+NVS_REF_MBPS = 18.0                 # reference rate for NVS-RATE (see SliceConfig)
+UE1_IP, UE2_IP = "10.45.0.39", "10.45.0.40"
+UE_SCHED = "PF"                     # per-slice UE scheduler (proportional fair)
+SLICE_STATS_PERIOD_MS = 1000
+SETTLE_AFTER_CONTROL_S = 2.0        # let the gNB apply the config before verifying
 
-try:
-    sys.path.append('/opt/flexric/python')
-    from xapp_sdk import XApp, E2Client
-    from e2ap import E2AP
-    from e2sm_kpm import E2SM_KPM
-    from e2sm_rc import E2SM_RC
-    from e2sm_slice import E2SM_Slice
-    FLEXRIC_AVAILABLE = True
-except ImportError:
-    FLEXRIC_AVAILABLE = False
-    # Define mock classes for development/testing outside testbed
-    class XApp:
-        def __init__(self, name): self.name = name
-        def run(self): pass
-        def stop(self): pass
-    class E2Client:
-        def control_request(self, msg): return {"status": "success"}
-        def subscribe(self, *args, **kwargs): pass
 
-# =============================================================================
-# CONFIGURATION AND CONSTANTS
-# =============================================================================
-
-# Default measurement duration per configuration (seconds)
-DEFAULT_MEASUREMENT_DURATION = 30
-
-# Total PRBs available in the testbed cell (from testbed report: 0-13 = 14 PRBs)
-TOTAL_PRBS = 14
-
-# Baseline throughput from Phase 1 (Mbit/s)
-BASELINE_THROUGHPUT_SENDER = 18.6
-BASELINE_THROUGHPUT_RECEIVER = 18.0
-
-# UE IPs for reference (from testbed)
-UE1_IP = "10.45.0.39"
-UE2_IP = "10.45.0.40"
-
-# Slice algorithms supported
 class SliceAlgorithm(Enum):
     STATIC = "STATIC"
     NVS_RATE = "NVS-RATE"
     NVS_CAPACITY = "NVS-CAPACITY"
     NONE = "NONE"
 
-# Slice operations
+
 class SliceOperation(Enum):
     ADD = "ADD"
     ASSOC = "ASSOC"
     DEL = "DEL"
     RESET = "RESET"
 
-# Configuration scenarios
+
 class Scenario(Enum):
     STATIC_BALANCED = "STATIC_BALANCED"
     STATIC_UNBALANCED = "STATIC_UNBALANCED"
     NVS_RATE_BALANCED = "NVS_RATE_BALANCED"
     NVS_RATE_UNBALANCED = "NVS_RATE_UNBALANCED"
 
+
 # =============================================================================
 # DATA CLASSES
 # =============================================================================
-
 @dataclass
 class SliceConfig:
-    """Configuration for a single slice."""
+    """One slice. STATIC uses pos_low/pos_high (PRB range, inclusive).
+    NVS-RATE uses mbps_rsvd (guaranteed rate) relative to mbps_ref: the slice
+    gets the fraction mbps_rsvd/mbps_ref of the resources, so the sum of
+    mbps_rsvd must stay <= mbps_ref (9+9 and 15+3 both = 18)."""
     slice_id: int
     label: str
     algorithm: SliceAlgorithm
-    # STATIC parameters
     pos_low: Optional[int] = None
     pos_high: Optional[int] = None
-    # NVS-RATE parameters
     mbps_rsvd: Optional[float] = None
-    # NVS-CAPACITY parameters
+    mbps_ref: Optional[float] = None
     percentage: Optional[int] = None
 
     def to_dict(self) -> Dict[str, Any]:
         d = asdict(self)
-        d['algorithm'] = self.algorithm.value
+        d["algorithm"] = self.algorithm.value
         return d
 
     @classmethod
-    def from_dict(cls, d: Dict[str, Any]) -> 'SliceConfig':
-        d = d.copy()
-        d['algorithm'] = SliceAlgorithm(d['algorithm'])
+    def from_dict(cls, d: Dict[str, Any]) -> "SliceConfig":
+        d = dict(d)
+        d["algorithm"] = SliceAlgorithm(d["algorithm"])
         return cls(**d)
 
 
 @dataclass
 class UEInfo:
-    """Information about a discovered UE."""
-    rnti: str
-    ip: str
-    namespace: str
+    rnti: str                       # hex string, e.g. "0xdf"
+    ip: str = ""
+    namespace: str = ""
     slice_id: Optional[int] = None
     associated: bool = False
 
 
 @dataclass
 class LogEntry:
-    """Structured log entry for all xApp activities."""
     timestamp: str
-    event_type: str  # COMMAND_SENT, ACK_RECEIVED, STATE_OBSERVED, ERROR, INFO
+    event_type: str     # COMMAND_SENT, ACK_RECEIVED, STATE_OBSERVED, STATE_VERIFIED, ...
     details: Dict[str, Any]
     scenario: Optional[str] = None
     configuration: Optional[str] = None
 
     def to_json(self) -> str:
-        return json.dumps(asdict(self), ensure_ascii=False)
+        return json.dumps(asdict(self), ensure_ascii=False, default=str)
 
 
 @dataclass
 class ScenarioResult:
-    """Results for a completed scenario."""
     scenario: Scenario
     start_time: str
     end_time: str
     slice_configs: List[SliceConfig]
-    ue_associations: Dict[str, int]  # rnti -> slice_id
+    ue_associations: Dict[str, int]
     commands_sent: List[LogEntry]
     acks_received: List[LogEntry]
     measurement_duration: int
     success: bool
     error_message: Optional[str] = None
+    state_verified: Optional[bool] = None   # informational (SLICE_STATS is unreliable)
 
 
 # =============================================================================
-# SCENARIO DEFINITIONS
+# SCENARIOS  (14 PRBs total; baseline ~18 Mbit/s)
 # =============================================================================
-
 def get_scenario_configs(scenario: Scenario) -> List[SliceConfig]:
-    """
-    Returns the slice configurations for a given scenario.
-
-    Based on testbed: 14 PRBs total (indices 0-13)
-    Baseline throughput: ~18.6 Mbit/s
-    """
-    configs = []
-
-    if scenario == Scenario.STATIC_BALANCED:
-        # Balanced: 7 PRBs each (0-6 and 7-13)
-        configs = [
-            SliceConfig(
-                slice_id=1,
-                label="slice_balanced_1",
-                algorithm=SliceAlgorithm.STATIC,
-                pos_low=0,
-                pos_high=6
-            ),
-            SliceConfig(
-                slice_id=2,
-                label="slice_balanced_2",
-                algorithm=SliceAlgorithm.STATIC,
-                pos_low=7,
-                pos_high=13
-            )
-        ]
-
-    elif scenario == Scenario.STATIC_UNBALANCED:
-        # Unbalanced: 11 PRBs (wide) + 3 PRBs (narrow)
-        configs = [
-            SliceConfig(
-                slice_id=1,
-                label="slice_wide",
-                algorithm=SliceAlgorithm.STATIC,
-                pos_low=0,
-                pos_high=10
-            ),
-            SliceConfig(
-                slice_id=2,
-                label="slice_narrow",
-                algorithm=SliceAlgorithm.STATIC,
-                pos_low=11,
-                pos_high=13
-            )
-        ]
-
-    elif scenario == Scenario.NVS_RATE_BALANCED:
-        # Balanced: ~9 Mbit/s each (half of ~18.6 baseline)
-        configs = [
-            SliceConfig(
-                slice_id=1,
-                label="slice_rate_balanced_1",
-                algorithm=SliceAlgorithm.NVS_RATE,
-                mbps_rsvd=9.0
-            ),
-            SliceConfig(
-                slice_id=2,
-                label="slice_rate_balanced_2",
-                algorithm=SliceAlgorithm.NVS_RATE,
-                mbps_rsvd=9.0
-            )
-        ]
-
-    elif scenario == Scenario.NVS_RATE_UNBALANCED:
-        # Unbalanced: 15 Mbit/s (wide) + 3 Mbit/s (narrow)
-        configs = [
-            SliceConfig(
-                slice_id=1,
-                label="slice_rate_wide",
-                algorithm=SliceAlgorithm.NVS_RATE,
-                mbps_rsvd=15.0
-            ),
-            SliceConfig(
-                slice_id=2,
-                label="slice_rate_narrow",
-                algorithm=SliceAlgorithm.NVS_RATE,
-                mbps_rsvd=3.0
-            )
-        ]
-
-    return configs
+    S, N = SliceAlgorithm.STATIC, SliceAlgorithm.NVS_RATE
+    if scenario == Scenario.STATIC_BALANCED:        # 7 + 7 PRBs
+        return [SliceConfig(1, "slice_bal_1", S, pos_low=0, pos_high=6),
+                SliceConfig(2, "slice_bal_2", S, pos_low=7, pos_high=13)]
+    if scenario == Scenario.STATIC_UNBALANCED:      # 11 + 3 PRBs
+        return [SliceConfig(1, "slice_wide", S, pos_low=0, pos_high=10),
+                SliceConfig(2, "slice_narrow", S, pos_low=11, pos_high=13)]
+    if scenario == Scenario.NVS_RATE_BALANCED:      # 9 + 9 Mbit/s
+        return [SliceConfig(1, "rate_bal_1", N, mbps_rsvd=9.0, mbps_ref=NVS_REF_MBPS),
+                SliceConfig(2, "rate_bal_2", N, mbps_rsvd=9.0, mbps_ref=NVS_REF_MBPS)]
+    if scenario == Scenario.NVS_RATE_UNBALANCED:    # 15 + 3 Mbit/s
+        return [SliceConfig(1, "rate_wide", N, mbps_rsvd=15.0, mbps_ref=NVS_REF_MBPS),
+                SliceConfig(2, "rate_narrow", N, mbps_rsvd=3.0, mbps_ref=NVS_REF_MBPS)]
+    raise ValueError(scenario)
 
 
 # =============================================================================
-# LOGGING MANAGER
+# LOGGING
 # =============================================================================
-
 class LoggingManager:
-    """
-    Manages structured logging for the xApp.
-    Writes to both console (for real-time monitoring) and JSONL file (for analysis).
-    """
+    """JSONL (machine) + .log (human) + console. Every entry is timestamped."""
 
-    def __init__(self, log_dir: str = "/tmp/xapp_logs", xapp_name: str = "slice_isolation"):
+    def __init__(self, log_dir: str = "/tmp/xapp_logs", xapp_name: str = "xapp_slice_isolation"):
         self.log_dir = Path(log_dir)
         self.log_dir.mkdir(parents=True, exist_ok=True)
-        self.xapp_name = xapp_name
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.jsonl_file = self.log_dir / f"{xapp_name}_{ts}.jsonl"
+        self.log_file = self.log_dir / f"{xapp_name}_{ts}.log"
+        self._lock = threading.Lock()   # SDK callbacks run in C threads
 
-        # JSONL file for structured analysis
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.jsonl_file = self.log_dir / f"{xapp_name}_{timestamp}.jsonl"
-
-        # Human-readable log file
-        self.log_file = self.log_dir / f"{xapp_name}_{timestamp}.log"
-
-        # Setup Python logging
-        self.logger = logging.getLogger(xapp_name)
+        self.logger = logging.getLogger(f"{xapp_name}_{ts}")
         self.logger.setLevel(logging.DEBUG)
-
-        # File handler
+        self.logger.propagate = False
         fh = logging.FileHandler(self.log_file)
-        fh.setLevel(logging.DEBUG)
-        fh.setFormatter(logging.Formatter(
-            '%(asctime)s | %(levelname)-8s | %(message)s',
-            datefmt='%Y-%m-%d %H:%M:%S'
-        ))
-
-        # Console handler
+        fh.setFormatter(logging.Formatter("%(asctime)s | %(levelname)-8s | %(message)s"))
         ch = logging.StreamHandler()
         ch.setLevel(logging.INFO)
-        ch.setFormatter(logging.Formatter(
-            '%(asctime)s | %(levelname)-8s | %(message)s',
-            datefmt='%H:%M:%S'
-        ))
-
+        ch.setFormatter(logging.Formatter("%(asctime)s | %(levelname)-8s | %(message)s", "%H:%M:%S"))
         self.logger.addHandler(fh)
         self.logger.addHandler(ch)
-
-        self.logger.info(f"Logging initialized. JSONL: {self.jsonl_file}")
-        self.logger.info(f"Human-readable log: {self.log_file}")
+        self.logger.info(f"JSONL: {self.jsonl_file}")
 
     def log(self, entry: LogEntry):
-        """Write a log entry to both JSONL and human-readable log."""
-        # JSONL for machine processing
-        with open(self.jsonl_file, 'a') as f:
-            f.write(entry.to_json() + '\n')
-
-        # Human-readable
-        level = logging.ERROR if entry.event_type == "ERROR" else logging.INFO
+        with self._lock:
+            with open(self.jsonl_file, "a") as f:
+                f.write(entry.to_json() + "\n")
+        sc = entry.scenario
+        sc = sc.value if hasattr(sc, "value") else sc
         msg = f"[{entry.event_type}] {entry.details}"
-        if entry.scenario:
-            msg = f"[{entry.scenario.value if hasattr(entry.scenario, 'value') else entry.scenario}] {msg}"
-        self.logger.log(level, msg)
+        if sc:
+            msg = f"[{sc}] {msg}"
+        # keep very large state dumps out of the console (they stay in the JSONL)
+        if entry.event_type == "STATE_OBSERVED":
+            self.logger.debug(msg)
+        else:
+            self.logger.log(logging.ERROR if entry.event_type == "ERROR" else logging.INFO, msg)
 
-    def info(self, message: str, scenario: Optional[Scenario] = None):
-        self.log(LogEntry(
-            timestamp=datetime.now().isoformat(),
-            event_type="INFO",
-            details={"message": message},
-            scenario=scenario.value if scenario else None
-        ))
+    def _e(self, etype, details, scenario=None):
+        sc = scenario.value if hasattr(scenario, "value") else scenario
+        self.log(LogEntry(datetime.now().isoformat(), etype, details, sc))
 
-    def error(self, message: str, scenario: Optional[Scenario] = None, exc: Optional[Exception] = None):
-        details = {"message": message}
+    def info(self, message, scenario=None):
+        self._e("INFO", {"message": message}, scenario)
+
+    def error(self, message, scenario=None, exc: Optional[Exception] = None):
+        d = {"message": message}
         if exc:
-            details["exception"] = str(exc)
-        self.log(LogEntry(
-            timestamp=datetime.now().isoformat(),
-            event_type="ERROR",
-            details=details,
-            scenario=scenario.value if scenario else None
-        ))
+            d["exception"] = repr(exc)
+        self._e("ERROR", d, scenario)
 
-    def command_sent(self, operation: SliceOperation, slice_config: SliceConfig,
-                     scenario: Scenario, extra: Dict = None):
-        details = {
-            "operation": operation.value,
-            "slice_config": slice_config.to_dict()
-        }
-        if extra:
-            details.update(extra)
-        self.log(LogEntry(
-            timestamp=datetime.now().isoformat(),
-            event_type="COMMAND_SENT",
-            details=details,
-            scenario=scenario.value
-        ))
+    def command_sent(self, operation: SliceOperation, payload: Dict, scenario):
+        self._e("COMMAND_SENT", {"operation": operation.value, **payload}, scenario)
 
-    def ack_received(self, operation: SliceOperation, slice_id: int,
-                     success: bool, scenario: Scenario, extra: Dict = None):
-        details = {
-            "operation": operation.value,
-            "slice_id": slice_id,
-            "success": success
-        }
-        if extra:
-            details.update(extra)
-        self.log(LogEntry(
-            timestamp=datetime.now().isoformat(),
-            event_type="ACK_RECEIVED",
-            details=details,
-            scenario=scenario.value
-        ))
+    def ack_received(self, operation: SliceOperation, success: bool, latency_ms: float,
+                     scenario, extra: Optional[Dict] = None):
+        self._e("ACK_RECEIVED", {"operation": operation.value, "success": success,
+                                 "latency_ms": round(latency_ms, 1), **(extra or {})}, scenario)
 
-    def state_observed(self, state: Dict, scenario: Scenario):
-        self.log(LogEntry(
-            timestamp=datetime.now().isoformat(),
-            event_type="STATE_OBSERVED",
-            details={"state": state},
-            scenario=scenario.value
-        ))
+    def state_observed(self, state: Dict, scenario):
+        self._e("STATE_OBSERVED", {"state": state}, scenario)
 
-    def ue_discovered(self, ue: UEInfo, scenario: Scenario):
-        self.log(LogEntry(
-            timestamp=datetime.now().isoformat(),
-            event_type="UE_DISCOVERED",
-            details={"rnti": ue.rnti, "ip": ue.ip, "namespace": ue.namespace},
-            scenario=scenario.value
-        ))
+    def state_verified(self, match: bool, expected: Dict, observed: Dict, mismatches: List[str], scenario):
+        self._e("STATE_VERIFIED", {"match": match, "mismatches": mismatches,
+                                   "expected": expected, "observed": observed}, scenario)
 
-    def ue_associated(self, rnti: str, slice_id: int, scenario: Scenario):
-        self.log(LogEntry(
-            timestamp=datetime.now().isoformat(),
-            event_type="UE_ASSOCIATED",
-            details={"rnti": rnti, "slice_id": slice_id},
-            scenario=scenario.value
-        ))
+    def ue_discovered(self, ue: UEInfo, scenario):
+        self._e("UE_DISCOVERED", {"rnti": ue.rnti}, scenario)
+
+    def ue_associated(self, rnti: str, slice_id: int, scenario):
+        self._e("UE_ASSOCIATED", {"rnti": rnti, "slice_id": slice_id}, scenario)
 
 
 # =============================================================================
-# E2 MESSAGE BUILDERS
+# FLEXRIC ADAPTER  (all SDK-specific code is here)
 # =============================================================================
+def _g(obj, path: str, default=None):
+    """Safe nested getattr: _g(ind, 'slice_stats.dl.len_slices')."""
+    for p in path.split("."):
+        try:
+            obj = getattr(obj, p)
+        except Exception:
+            return default
+    return obj
 
-class E2MessageBuilder:
-    """
-    Builds E2 control messages for slice operations.
 
-    Based on the E2SM-RC (Radio Control) and E2SM-Slice service models
-    as observed in the testbed xapp_slice_moni_ctrl.py behavior.
+class FlexRICAdapter:
+    """Thin wrapper around the FlexRIC Python SDK (xapp_sdk).
+
+    Control calls (ric.control_slice_sm) are synchronous: the SDK sends the
+    RIC CONTROL REQUEST and blocks until the CONTROL ACK, which is why the
+    reference xApp prints 'CONTROL-REQUEST tx / CONTROL ACK rx / Successfully
+    received CONTROL response' in order. Returning without exception == ACK.
     """
+
+    def __init__(self, ric_module, logger: LoggingManager, extra_argv: List[str]):
+        self.ric = ric_module
+        self.log = logger
+        self.lock = threading.Lock()
+        self.rntis: List[str] = []              # discovered RNTIs (hex strings)
+        self.last_slice_state: Dict[str, Any] = {}
+        self.current_scenario = None
+        self.conn = None
+        self.node_id = None
+        self._cbs = []                          # keep callbacks alive (GC!)
+        self.ric.init(extra_argv)
+        self.conn = self.ric.conn_e2_nodes()
+        if len(self.conn) == 0:
+            raise RuntimeError("No E2 node connected to the RIC (start RIC then gNB first)")
+        self.node_id = self.conn[0].id
+
+    # ---- subscriptions ----------------------------------------------------
+    def subscribe(self):
+        ric, adapter = self.ric, self
+
+        class MacCb(ric.mac_cb):
+            def __init__(self):
+                ric.mac_cb.__init__(self)
+
+            def handle(self, ind):
+                try:
+                    for u in ind.ue_stats:
+                        r = hex(u.rnti)
+                        with adapter.lock:
+                            if r not in adapter.rntis:
+                                adapter.rntis.append(r)
+                except Exception as e:
+                    adapter.log.error("MAC callback error", adapter.current_scenario, e)
+
+        class SliceCb(ric.slice_cb):
+            def __init__(self):
+                ric.slice_cb.__init__(self)
+
+            def handle(self, ind):
+                try:
+                    st = adapter.slice_ind_to_dict(ind)
+                    with adapter.lock:
+                        adapter.last_slice_state = st
+                    adapter.log.state_observed(st, adapter.current_scenario)
+                except Exception as e:
+                    adapter.log.error("SLICE callback error", adapter.current_scenario, e)
+
+        mac, sl = MacCb(), SliceCb()
+        self._cbs += [mac, sl]
+        self.ric.report_mac_sm(self.node_id, self.ric.Interval_ms_10, mac)
+        self.ric.report_slice_sm(self.node_id, self.ric.Interval_ms_1000, sl)
+        self.log.info("Subscribed to MAC (RNTI discovery) and SLICE_STATS")
 
     @staticmethod
-    def build_slice_add(slice_config: SliceConfig) -> Dict[str, Any]:
-        """Build ADD slice control message."""
-        msg = {
-            "operation": "ADD",
-            "slice_id": slice_config.slice_id,
-            "label": slice_config.label,
-            "algorithm": slice_config.algorithm.value
-        }
+    def slice_ind_to_dict(ind) -> Dict[str, Any]:
+        """Convert a SLICE_STATS indication to a plain dict (same fields as
+        the reference xApp writes into rt_slice_stats.json)."""
+        names = {1: "STATIC", 2: "NVS", 3: "SCN19", 4: "EDF"}
+        slices = []
+        for s in (_g(ind, "slice_stats.dl.slices", []) or []):
+            t = _g(s, "params.type")
+            d = {"id": _g(s, "id"), "algo": names.get(t, str(t))}
+            if t == 1:
+                d["pos_low"] = _g(s, "params.u.sta.pos_low")
+                d["pos_high"] = _g(s, "params.u.sta.pos_high")
+            elif t == 2:
+                d["mbps_rsvd"] = _g(s, "params.u.nvs.u.rate.u1.mbps_required")
+            slices.append(d)
+        slices = slices[: int(_g(ind, "slice_stats.dl.len_slices", 0) or 0)]
+        ues = [{"rnti": hex(_g(u, "rnti", 0)), "dl_id": _g(u, "dl_id")}
+               for u in (_g(ind, "ue_slice_stats.ues", []) or [])]
+        return {"num_slices": _g(ind, "slice_stats.dl.len_slices", 0),
+                "slices": slices, "ues": ues}
 
-        if slice_config.algorithm == SliceAlgorithm.STATIC:
-            msg["pos_low"] = slice_config.pos_low
-            msg["pos_high"] = slice_config.pos_high
-        elif slice_config.algorithm == SliceAlgorithm.NVS_RATE:
-            msg["mbps_rsvd"] = slice_config.mbps_rsvd
-        elif slice_config.algorithm == SliceAlgorithm.NVS_CAPACITY:
-            msg["percentage"] = slice_config.percentage
+    # ---- message builders -------------------------------------------------
+    def _make_slice(self, c: SliceConfig):
+        ric = self.ric
+        s = ric.fr_slice_t()
+        s.id = c.slice_id
+        s.label = c.label
+        s.len_label = len(c.label)
+        s.sched = UE_SCHED
+        s.len_sched = len(UE_SCHED)
+        if c.algorithm == SliceAlgorithm.STATIC:
+            s.params.type = ric.SLICE_ALG_SM_V0_STATIC
+            s.params.u.sta.pos_low = c.pos_low
+            s.params.u.sta.pos_high = c.pos_high
+        elif c.algorithm == SliceAlgorithm.NVS_RATE:
+            s.params.type = ric.SLICE_ALG_SM_V0_NVS
+            s.params.u.nvs.conf = ric.SLICE_SM_NVS_V0_RATE
+            s.params.u.nvs.u.rate.u1.mbps_required = c.mbps_rsvd
+            s.params.u.nvs.u.rate.u2.mbps_reference = c.mbps_ref
+        elif c.algorithm == SliceAlgorithm.NVS_CAPACITY:
+            s.params.type = ric.SLICE_ALG_SM_V0_NVS
+            s.params.u.nvs.conf = ric.SLICE_SM_NVS_V0_CAPACITY
+            s.params.u.nvs.u.capacity.u.pct_reserved = c.percentage
+        return s
 
+    def build_add(self, configs: List[SliceConfig]):
+        ric = self.ric
+        msg = ric.slice_ctrl_msg_t()
+        msg.type = ric.SLICE_CTRL_SM_V0_ADD
+        dl = msg.u.add_mod_slice.dl
+        dl.len_slices = len(configs)
+        dl.sched_name = UE_SCHED
+        dl.len_sched_name = len(UE_SCHED)
+        arr = ric.slice_array(len(configs))
+        for i, c in enumerate(configs):
+            arr[i] = self._make_slice(c)
+        dl.slices = arr
         return msg
 
-    @staticmethod
-    def build_slice_assoc(rnti: str, slice_id: int) -> Dict[str, Any]:
-        """Build ASSOC (associate UE to slice) control message."""
-        return {
-            "operation": "ASSOC",
-            "slice_id": slice_id,
-            "rnti": rnti
-        }
+    def build_assoc(self, pairs: List[tuple]):
+        ric = self.ric
+        msg = ric.slice_ctrl_msg_t()
+        msg.type = ric.SLICE_CTRL_SM_V0_UE_SLICE_ASSOC
+        msg.u.ue_slice.len_ue_slice = len(pairs)
+        arr = ric.ue_slice_assoc_array(len(pairs))
+        for i, (rnti_hex, slice_id) in enumerate(pairs):
+            a = ric.ue_slice_assoc_t()
+            a.rnti = int(rnti_hex, 16)
+            a.dl_id = slice_id
+            arr[i] = a
+        msg.u.ue_slice.ues = arr
+        return msg
 
-    @staticmethod
-    def build_slice_del(slice_id: int) -> Dict[str, Any]:
-        """Build DEL (delete slice) control message."""
-        return {
-            "operation": "DEL",
-            "slice_id": slice_id
-        }
+    def build_del(self, slice_ids: List[int]):
+        ric = self.ric
+        msg = ric.slice_ctrl_msg_t()
+        msg.type = ric.SLICE_CTRL_SM_V0_DEL
+        msg.u.del_slice.len_dl = len(slice_ids)
+        arr = ric.del_dl_array(len(slice_ids))
+        for i, sid in enumerate(slice_ids):
+            arr[i] = sid
+        msg.u.del_slice.dl = arr
+        return msg
 
-    @staticmethod
-    def build_slice_reset() -> Dict[str, Any]:
-        """Build RESET (reset all slices) control message."""
-        return {
-            "operation": "RESET",
-            "algorithm": "NONE"
-        }
+    def build_reset(self):
+        # RESET == ADD with zero slices: the gNB falls back to algo NONE.
+        return self.build_add([])
+
+    # ---- control ----------------------------------------------------------
+    def send(self, msg) -> None:
+        """Blocking: returns when CONTROL ACK received, raises otherwise."""
+        self.ric.control_slice_sm(self.node_id, msg)
+
+    def snapshot(self) -> Dict[str, Any]:
+        with self.lock:
+            return json.loads(json.dumps(self.last_slice_state, default=str))
+
+    def shutdown(self):
+        for fn in ("rm_report_slice_sm", "rm_report_mac_sm"):
+            try:
+                getattr(self.ric, fn)(self.node_id)
+            except Exception:
+                pass
 
 
 # =============================================================================
-# MAIN XAPP CLASS
+# MAIN XAPP
 # =============================================================================
-
-class SliceIsolationXApp(XApp):
-    """
-    Main xApp for Slice Isolation experiments.
-
-    This xApp:
-    1. Registers with the Near-RT RIC
-    2. Subscribes to KPM (MAC/RLC/PDCP/GTP) for RNTI discovery
-    3. Subscribes to SLICE_STATS for state monitoring
-    4. Runs a sequence of scenarios (STATIC/NVS-RATE, balanced/unbalanced)
-    5. For each scenario:
-       - Creates two slices with the specified algorithm
-       - Discovers UE RNTIs from KPM reports
-       - Associates each UE to a distinct slice
-       - Maintains configuration for measurement duration
-       - Logs all commands, ACKs, and states with timestamps
-       - Cleans up (DEL + RESET) before next scenario
-    """
-
-    def __init__(self,
-                 name: str = "xapp_slice_isolation",
-                 measurement_duration: int = DEFAULT_MEASUREMENT_DURATION,
-                 scenarios: List[Scenario] = None,
-                 log_dir: str = "/tmp/xapp_logs"):
-
-        super().__init__(name)
-
-        self.measurement_duration = measurement_duration
-        self.scenarios = scenarios or [
-            Scenario.STATIC_BALANCED,
-            Scenario.STATIC_UNBALANCED,
-            Scenario.NVS_RATE_BALANCED,
-            Scenario.NVS_RATE_UNBALANCED
-        ]
-        self.log_dir = log_dir
-
-        # Initialize logging
-        self.logging = LoggingManager(log_dir, name)
-
-        # E2 client for control requests
-        self.e2_client = E2Client()
-
-        # State tracking
-        self.connected_e2_nodes: List[Dict] = []
-        self.discovered_ues: Dict[str, UEInfo] = {}  # rnti -> UEInfo
-        self.current_scenario: Optional[Scenario] = None
-        self.current_slice_configs: List[SliceConfig] = []
-        self.slice_ids_created: List[int] = []
-        self.rnti_to_slice: Dict[str, int] = {}  # rnti -> slice_id
-        self.scenario_results: List[ScenarioResult] = []
-
-        # Synchronization
-        self.ack_event = threading.Event()
-        self.last_ack: Optional[Dict] = None
-        self.ues_discovered_event = threading.Event()
+class SliceIsolationXApp:
+    def __init__(self, adapter: FlexRICAdapter, logger: LoggingManager,
+                 measurement_duration: int, scenarios: List[Scenario]):
+        self.a = adapter
+        self.log = logger
+        self.duration = measurement_duration
+        self.scenarios = scenarios
+        self.results: List[ScenarioResult] = []
         self.running = False
-        self.scenario_complete = threading.Event()
+        self.created: List[int] = []
+        self.sc: Optional[Scenario] = None
 
-        # Register signal handlers for graceful shutdown
-        signal.signal(signal.SIGINT, self._signal_handler)
-        signal.signal(signal.SIGTERM, self._signal_handler)
-
-        self.logging.info(f"xApp {name} initialized")
-        self.logging.info(f"Scenarios to run: {[s.value for s in self.scenarios]}")
-        self.logging.info(f"Measurement duration per scenario: {measurement_duration}s")
-
-    def _signal_handler(self, signum, frame):
-        """Handle shutdown signals gracefully."""
-        self.logging.info(f"Received signal {signum}, initiating graceful shutdown...")
-        self.stop()
-
-    # -------------------------------------------------------------------------
-    # XAPP LIFECYCLE CALLBACKS
-    # -------------------------------------------------------------------------
-
-    def on_e2_setup(self, e2_node: Dict):
-        """
-        Called when an E2 node (gNodeB) connects to the RIC.
-        Subscribe to KPM and SLICE_STATS.
-        """
-        self.connected_e2_nodes.append(e2_node)
-        self.logging.info(f"E2 node connected: {e2_node.get('name', 'unknown')}")
-        self.logging.info(f"E2 node capabilities: {e2_node.get('ran_functions', [])}")
-
-        # Subscribe to KPM for RNTI discovery (MAC, RLC, PDCP, GTP)
-        self._subscribe_kpm(e2_node)
-
-        # Subscribe to SLICE_STATS for slice state monitoring
-        self._subscribe_slice_stats(e2_node)
-
-    def _subscribe_kpm(self, e2_node: Dict):
-        """Subscribe to KPM (Key Performance Measurement) reports."""
-        # Find KPM RAN function (typically MAC, RLC, PDCP, GTP)
-        kpm_functions = [rf for rf in e2_node.get('ran_functions', [])
-                         if rf.get('id') in [1, 2, 3, 4]]  # MAC=1, RLC=2, PDCP=3, GTP=4
-
-        for rf in kpm_functions:
-            try:
-                self.e2_client.subscribe(
-                    e2_node_id=e2_node['id'],
-                    ran_function_id=rf['id'],
-                    event_trigger={"type": "periodic", "period_ms": 1000},
-                    action={"type": "report", "format": "json"}
-                )
-                self.logging.info(f"Subscribed to KPM RAN function {rf['id']} ({rf.get('name', 'unknown')})")
-            except Exception as e:
-                self.logging.error(f"Failed to subscribe to KPM function {rf['id']}", exc=e)
-
-    def _subscribe_slice_stats(self, e2_node: Dict):
-        """Subscribe to SLICE_STATS reports."""
-        slice_functions = [rf for rf in e2_node.get('ran_functions', [])
-                           if 'slice' in rf.get('name', '').lower() or rf.get('id') == 5]
-
-        for rf in slice_functions:
-            try:
-                self.e2_client.subscribe(
-                    e2_node_id=e2_node['id'],
-                    ran_function_id=rf['id'],
-                    event_trigger={"type": "periodic", "period_ms": 1000},
-                    action={"type": "report", "format": "json"}
-                )
-                self.logging.info(f"Subscribed to SLICE_STATS RAN function {rf['id']}")
-            except Exception as e:
-                self.logging.error(f"Failed to subscribe to SLICE_STATS function {rf['id']}", exc=e)
-
-    def on_kpm_indication(self, indication: Dict):
-        """
-        Handle KPM indication (measurement report).
-        Extract RNTI from MAC/RLC/PDCP reports.
-        """
-        # Extract RNTI from the indication
-        # Format depends on E2SM-KPM report structure
+    # ---- one control operation with logging + ACK timing ------------------
+    def _do(self, op: SliceOperation, payload: Dict, msg) -> bool:
+        self.log.command_sent(op, payload, self.sc)
+        t0 = time.time()
         try:
-            # The indication contains measurement records per UE
-            # Each record has UE ID (RNTI) and metrics
-            ue_records = indication.get('ue_records', [])
-            for record in ue_records:
-                rnti = record.get('rnti') or record.get('ue_id')
-                if rnti and rnti not in self.discovered_ues:
-                    # Determine UE IP/namespace from RNTI (testbed has 2 UEs)
-                    ue_info = self._identify_ue(rnti)
-                    self.discovered_ues[rnti] = ue_info
-                    self.logging.ue_discovered(ue_info, self.current_scenario or Scenario.STATIC_BALANCED)
-
-            # Signal that UEs have been discovered (need at least 2)
-            if len(self.discovered_ues) >= 2:
-                self.ues_discovered_event.set()
-
+            self.a.send(msg)
+            ok, err = True, None
         except Exception as e:
-            self.logging.error("Error processing KPM indication", exc=e)
+            ok, err = False, repr(e)
+        self.log.ack_received(op, ok, (time.time() - t0) * 1000, self.sc,
+                              {"error": err} if err else None)
+        return ok
 
-    def _identify_ue(self, rnti: str) -> UEInfo:
-        """Map RNTI to UE info (IP, namespace)."""
-        # In testbed: ue1=10.45.0.39, ue2=10.45.0.40
-        # We'll assign based on order of discovery
-        ue_index = len(self.discovered_ues)
-        if ue_index == 0:
-            return UEInfo(rnti=rnti, ip=UE1_IP, namespace="ue1")
-        else:
-            return UEInfo(rnti=rnti, ip=UE2_IP, namespace="ue2")
+    def slice_add(self, configs):
+        return self._do(SliceOperation.ADD, {"slices": [c.to_dict() for c in configs]},
+                        self.a.build_add(configs))
 
-    def on_slice_stats_indication(self, indication: Dict):
-        """Handle SLICE_STATS indication (slice state report)."""
-        # Note: Testbed showed this JSON is unreliable
-        # We log it for reference but don't trust it for verification
-        try:
-            self.logging.state_observed(indication, self.current_scenario or Scenario.STATIC_BALANCED)
-        except Exception as e:
-            self.logging.error("Error processing SLICE_STATS indication", exc=e)
+    def slice_assoc(self, pairs):
+        return self._do(SliceOperation.ASSOC, {"assoc": [{"rnti": r, "slice_id": s} for r, s in pairs]},
+                        self.a.build_assoc(pairs))
 
-    def on_control_ack(self, ack: Dict):
-        """
-        Handle control acknowledgment from gNodeB.
-        """
-        self.last_ack = ack
-        success = ack.get('status') == 'success'
-        slice_id = ack.get('slice_id')
-        operation = ack.get('operation')
+    def slice_del(self, ids):
+        return self._do(SliceOperation.DEL, {"slice_ids": ids}, self.a.build_del(ids))
 
-        try:
-            op_enum = SliceOperation(operation) if operation else None
-        except ValueError:
-            op_enum = None
+    def slice_reset(self):
+        return self._do(SliceOperation.RESET, {"algorithm": "NONE"}, self.a.build_reset())
 
-        self.logging.ack_received(
-            operation=op_enum or SliceOperation.ADD,
-            slice_id=slice_id or 0,
-            success=success,
-            scenario=self.current_scenario or Scenario.STATIC_BALANCED,
-            extra={"ack_details": ack}
-        )
+    # ---- verification: requested config vs state reported by the gNB ------
+    def verify_state(self, configs, assoc: Dict[str, int]) -> bool:
+        obs = self.a.snapshot()
+        exp = {"num_slices": len(configs),
+               "slices": [c.to_dict() for c in configs],
+               "assoc": assoc}
+        mism = []
+        if obs.get("num_slices") != len(configs):
+            mism.append(f"num_slices expected {len(configs)} got {obs.get('num_slices')}")
+        by_id = {s.get("id"): s for s in obs.get("slices", [])}
+        for c in configs:
+            o = by_id.get(c.slice_id)
+            if o is None:
+                mism.append(f"slice {c.slice_id} missing")
+            elif c.algorithm == SliceAlgorithm.STATIC and \
+                    (o.get("pos_low"), o.get("pos_high")) != (c.pos_low, c.pos_high):
+                mism.append(f"slice {c.slice_id} PRB range expected {c.pos_low}-{c.pos_high} "
+                            f"got {o.get('pos_low')}-{o.get('pos_high')}")
+            elif c.algorithm == SliceAlgorithm.NVS_RATE and o.get("mbps_rsvd") != c.mbps_rsvd:
+                mism.append(f"slice {c.slice_id} mbps expected {c.mbps_rsvd} got {o.get('mbps_rsvd')}")
+        obs_assoc = {u["rnti"]: u["dl_id"] for u in obs.get("ues", [])}
+        for r, sid in assoc.items():
+            if obs_assoc.get(r) != sid:
+                mism.append(f"UE {r} expected slice {sid} got {obs_assoc.get(r)}")
+        match = not mism
+        self.log.state_verified(match, exp, obs, mism, self.sc)
+        return match
 
-        # Signal ACK received
-        self.ack_event.set()
+    def wait_for_ues(self, n=2, timeout=15.0) -> List[str]:
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            with self.a.lock:
+                if len(self.a.rntis) >= n:
+                    return sorted(self.a.rntis, key=lambda x: int(x, 16))
+            time.sleep(0.5)
+        raise RuntimeError(f"Only {len(self.a.rntis)} UE RNTI(s) seen in MAC reports (need {n})")
 
-    # -------------------------------------------------------------------------
-    # SLICE CONTROL OPERATIONS
-    # -------------------------------------------------------------------------
-
-    def send_control(self, control_msg: Dict, timeout: float = 5.0) -> bool:
-        """
-        Send a control request and wait for ACK.
-        Returns True if ACK received with success, False otherwise.
-        """
-        self.ack_event.clear()
-        self.last_ack = None
-
-        try:
-            # Send control request via E2 client
-            # In real FlexRIC: self.e2_client.control_request(control_msg)
-            # For now, simulate the call
-            self.e2_client.control_request(control_msg)
-
-            # Wait for ACK
-            ack_received = self.ack_event.wait(timeout=timeout)
-
-            if not ack_received:
-                self.logging.error(f"Timeout waiting for ACK for {control_msg.get('operation')}")
-                return False
-
-            if self.last_ack and self.last_ack.get('status') == 'success':
-                return True
-            else:
-                self.logging.error(f"Control failed: {self.last_ack}")
-                return False
-
-        except Exception as e:
-            self.logging.error(f"Error sending control: {e}", exc=e)
-            return False
-
-    def slice_add(self, slice_config: SliceConfig) -> bool:
-        """Send ADD slice command."""
-        msg = E2MessageBuilder.build_slice_add(slice_config)
-        self.logging.command_sent(SliceOperation.ADD, slice_config, self.current_scenario)
-        return self.send_control(msg)
-
-    def slice_assoc(self, rnti: str, slice_id: int) -> bool:
-        """Send ASSOC (associate UE to slice) command."""
-        msg = E2MessageBuilder.build_slice_assoc(rnti, slice_id)
-        self.logging.command_sent(SliceOperation.ASSOC,
-                                  SliceConfig(slice_id=slice_id, label="", algorithm=SliceAlgorithm.STATIC),
-                                  self.current_scenario,
-                                  extra={"rnti": rnti})
-        return self.send_control(msg)
-
-    def slice_del(self, slice_id: int) -> bool:
-        """Send DEL (delete slice) command."""
-        msg = E2MessageBuilder.build_slice_del(slice_id)
-        self.logging.command_sent(SliceOperation.DEL,
-                                  SliceConfig(slice_id=slice_id, label="", algorithm=SliceAlgorithm.STATIC),
-                                  self.current_scenario)
-        return self.send_control(msg)
-
-    def slice_reset(self) -> bool:
-        """Send RESET command."""
-        msg = E2MessageBuilder.build_slice_reset()
-        self.logging.command_sent(SliceOperation.RESET,
-                                  SliceConfig(slice_id=0, label="", algorithm=SliceAlgorithm.NONE),
-                                  self.current_scenario)
-        return self.send_control(msg)
-
-    # -------------------------------------------------------------------------
-    # SCENARIO EXECUTION
-    # -------------------------------------------------------------------------
-
+    # ---- scenario ---------------------------------------------------------
     def run_scenario(self, scenario: Scenario) -> ScenarioResult:
-        """
-        Execute a complete scenario:
-        1. Create two slices with specified algorithm
-        2. Wait for UE discovery (RNTI from KPM)
-        3. Associate each UE to a distinct slice
-        4. Maintain configuration for measurement duration
-        5. Clean up (DEL + RESET)
-        """
-        self.current_scenario = scenario
-        self.slice_ids_created = []
-        self.rnti_to_slice = {}
-        self.ues_discovered_event.clear()
-
-        start_time = datetime.now().isoformat()
-        self.logging.info(f"Starting scenario: {scenario.value}")
-
-        # Get slice configurations for this scenario
-        slice_configs = get_scenario_configs(scenario)
-        self.current_slice_configs = slice_configs
-
-        commands_sent = []
-        acks_received = []
-        success = True
-        error_message = None
-
+        self.sc = scenario
+        self.a.current_scenario = scenario
+        self.created = []
+        configs = get_scenario_configs(scenario)
+        assoc: Dict[str, int] = {}
+        start = datetime.now().isoformat()
+        ok, err, verified = True, None, None
+        self.log.info(f"Starting scenario {scenario.value}", scenario)
         try:
-            # Step 1: ADD both slices
-            for slice_config in slice_configs:
-                self.logging.info(f"Creating slice {slice_config.slice_id} ({slice_config.label})")
-                if not self.slice_add(slice_config):
-                    raise RuntimeError(f"Failed to create slice {slice_config.slice_id}")
-                self.slice_ids_created.append(slice_config.slice_id)
-                time.sleep(0.5)  # Small delay between commands
+            # 1. RNTIs first (they come from MAC reports, independent of slices)
+            rntis = self.wait_for_ues(2)
+            for r in rntis:
+                self.log.ue_discovered(UEInfo(r), scenario)
 
-            # Step 2: Wait for UE discovery (RNTI from KPM reports)
-            self.logging.info("Waiting for UE RNTI discovery from KPM reports...")
-            discovered = self.ues_discovered_event.wait(timeout=10.0)
-            if not discovered or len(self.discovered_ues) < 2:
-                raise RuntimeError(f"Insufficient UEs discovered: {len(self.discovered_ues)}")
+            # 2. ADD both slices in a single control message
+            if not self.slice_add(configs):
+                raise RuntimeError("ADD failed (no CONTROL ACK / error)")
+            self.created = [c.slice_id for c in configs]
+            time.sleep(0.5)
 
-            self.logging.info(f"Discovered {len(self.discovered_ues)} UEs: {list(self.discovered_ues.keys())}")
+            # 3. ASSOC: lowest RNTI -> slice 1, next -> slice 2 (deterministic)
+            pairs = [(rntis[i], configs[i].slice_id) for i in range(2)]
+            if not self.slice_assoc(pairs):
+                raise RuntimeError("ASSOC failed")
+            for r, sid in pairs:
+                assoc[r] = sid
+                self.log.ue_associated(r, sid, scenario)
 
-            # Step 3: Associate each UE to a distinct slice
-            # Sort UEs by RNTI for deterministic assignment
-            sorted_ues = sorted(self.discovered_ues.items())
+            # 4. Verify reported state vs request (informational, JSON is flaky)
+            time.sleep(SETTLE_AFTER_CONTROL_S)
+            verified = self.verify_state(configs, assoc)
 
-            for i, (rnti, ue_info) in enumerate(sorted_ues[:2]):  # Only first 2 UEs
-                slice_id = slice_configs[i].slice_id
-                self.logging.info(f"Associating UE {rnti} ({ue_info.namespace}) to slice {slice_id}")
-                if not self.slice_assoc(rnti, slice_id):
-                    raise RuntimeError(f"Failed to associate UE {rnti} to slice {slice_id}")
-                self.rnti_to_slice[rnti] = slice_id
-                ue_info.slice_id = slice_id
-                ue_info.associated = True
-                self.logging.ue_associated(rnti, slice_id, scenario)
-                time.sleep(0.5)
+            # 5. Hold the configuration for the measurement window
+            self.log.info(">>> START IPERF3 NOW (config active for "
+                          f"{self.duration}s) <<<", scenario)
+            self.log.info(f"  server: sudo ip netns exec ue1 iperf3 -s", scenario)
+            self.log.info(f"  client: sudo ip netns exec ue2 iperf3 -c {UE1_IP} -t {self.duration}", scenario)
+            time.sleep(self.duration)
 
-            # Step 4: Maintain configuration for measurement duration
-            self.logging.info(f"Configuration active. Maintaining for {self.measurement_duration}s for measurements...")
-            self.logging.info(">>> START IPERF3 MEASUREMENTS NOW <<<")
-            self.logging.info(f"  Server (ue1): sudo ip netns exec ue1 iperf3 -s")
-            self.logging.info(f"  Client (ue2): sudo ip netns exec ue2 iperf3 -c {UE1_IP} -t {self.measurement_duration}")
-
-            # Wait for measurement duration
-            # In real deployment, this is when external iperf3 runs
-            time.sleep(self.measurement_duration)
-
-            self.logging.info("Measurement period complete.")
-
-            # Step 5: Clean up - DEL slices then RESET
-            self.logging.info("Cleaning up: deleting slices...")
-            for slice_id in reversed(self.slice_ids_created):  # Delete in reverse order
-                if not self.slice_del(slice_id):
-                    self.logging.error(f"Failed to delete slice {slice_id} (continuing)")
-                time.sleep(0.5)
-
-            self.logging.info("Resetting slice configuration...")
-            if not self.slice_reset():
-                self.logging.error("Failed to reset (continuing)")
-
-            # Wait a bit for reset to propagate
-            time.sleep(2.0)
-
+            # 6. Cleanup: DEL both slices then RESET
+            self._cleanup()
         except Exception as e:
-            success = False
-            error_message = str(e)
-            self.logging.error(f"Scenario {scenario.value} failed: {e}", exc=e)
-            # Attempt cleanup
-            self._cleanup_on_error()
+            ok, err = False, str(e)
+            self.log.error(f"Scenario {scenario.value} failed: {e}", scenario, e)
+            self._cleanup()
 
-        end_time = datetime.now().isoformat()
+        res = ScenarioResult(scenario, start, datetime.now().isoformat(), configs, assoc,
+                             [], [], self.duration, ok, err, verified)
+        self.results.append(res)
+        return res
 
-        result = ScenarioResult(
-            scenario=scenario,
-            start_time=start_time,
-            end_time=end_time,
-            slice_configs=slice_configs,
-            ue_associations=self.rnti_to_slice.copy(),
-            commands_sent=[],  # Would be populated from logging
-            acks_received=[],
-            measurement_duration=self.measurement_duration,
-            success=success,
-            error_message=error_message
-        )
-
-        self.scenario_results.append(result)
-
-        if success:
-            self.logging.info(f"Scenario {scenario.value} completed successfully")
-        else:
-            self.logging.error(f"Scenario {scenario.value} failed: {error_message}")
-
-        return result
-
-    def _cleanup_on_error(self):
-        """Attempt cleanup on error."""
+    def _cleanup(self):
         try:
-            for slice_id in reversed(self.slice_ids_created):
-                self.slice_del(slice_id)
-                time.sleep(0.5)
+            if self.created:
+                self.slice_del(list(reversed(self.created)))
+                self.created = []
             self.slice_reset()
-            time.sleep(2.0)
+            time.sleep(SETTLE_AFTER_CONTROL_S)
         except Exception as e:
-            self.logging.error(f"Cleanup failed: {e}", exc=e)
+            self.log.error("Cleanup failed", self.sc, e)
 
-    def run_all_scenarios(self):
-        """Run all configured scenarios in sequence."""
+    def run_all(self):
         self.running = True
-        self.logging.info("=" * 60)
-        self.logging.info("STARTING SLICE ISOLATION EXPERIMENTS")
-        self.logging.info("=" * 60)
-
-        for scenario in self.scenarios:
+        self.log.info("=" * 50 + " SLICE ISOLATION EXPERIMENTS " + "=" * 50)
+        for i, sc in enumerate(self.scenarios):
             if not self.running:
                 break
-
-            self.run_scenario(scenario)
-
-            # Delay between scenarios
-            if scenario != self.scenarios[-1]:
-                self.logging.info("Waiting 5s before next scenario...")
-                time.sleep(5.0)
-
+            self.run_scenario(sc)
+            if i < len(self.scenarios) - 1:
+                time.sleep(5)
         self.running = False
-        self._print_summary()
+        self.summary()
 
-    def _print_summary(self):
-        """Print experiment summary."""
-        self.logging.info("=" * 60)
-        self.logging.info("EXPERIMENT SUMMARY")
-        self.logging.info("=" * 60)
-
-        for result in self.scenario_results:
-            status = "SUCCESS" if result.success else "FAILED"
-            self.logging.info(f"  {result.scenario.value}: {status}")
-            if result.error_message:
-                self.logging.info(f"    Error: {result.error_message}")
-            self.logging.info(f"    Slices: {[f'{s.slice_id}({s.label})' for s in result.slice_configs]}")
-            self.logging.info(f"    UE Associations: {result.ue_associations}")
-
-        self.logging.info(f"Logs saved to: {self.logging.log_dir}")
-
-    def stop(self):
-        """Stop the xApp gracefully."""
-        self.logging.info("Stopping xApp...")
-        self.running = False
-        # Attempt final cleanup
-        if self.slice_ids_created:
-            self._cleanup_on_error()
-        super().stop()
+    def summary(self):
+        self.log.info("=" * 30 + " SUMMARY " + "=" * 30)
+        for r in self.results:
+            st = "SUCCESS" if r.success else "FAILED"
+            v = {True: "state matches", False: "state MISMATCH (see STATE_VERIFIED)",
+                 None: "state not checked"}[r.state_verified]
+            self.log.info(f"  {r.scenario.value}: {st} | {v}")
+            if r.error_message:
+                self.log.info(f"    error: {r.error_message}")
+            self.log.info(f"    slices: {[f'{c.slice_id}({c.label})' for c in r.slice_configs]}")
+            self.log.info(f"    UE associations: {r.ue_associations}")
+        self.log.info(f"Logs: {self.log.log_dir}")
 
 
 # =============================================================================
-# MAIN ENTRY POINT
+# ENTRY POINT
 # =============================================================================
+def load_sdk():
+    """Import the REAL SDK or fail loudly (no silent mock)."""
+    for p in ("/opt/flexric/python", "/usr/local/lib/python3/dist-packages",
+              str(Path.home() / "ieeetestbed/oran/flexric/build-python/src/xApp/swig")):
+        if p not in sys.path:
+            sys.path.append(p)
+    try:
+        import xapp_sdk as ric
+        return ric
+    except ImportError as e:
+        raise SystemExit(f"FATAL: cannot import xapp_sdk ({e}). Run from the FlexRIC "
+                         f"build-python/examples/xApp/python3 directory, like xapp_slice_moni_ctrl.py.")
+
+
+def probe(ric):
+    """Print the SDK names this xApp relies on, to validate them on your build."""
+    needed = ["init", "conn_e2_nodes", "report_mac_sm", "report_slice_sm", "control_slice_sm",
+              "mac_cb", "slice_cb", "Interval_ms_10", "Interval_ms_1000",
+              "slice_ctrl_msg_t", "fr_slice_t", "slice_array", "ue_slice_assoc_t",
+              "ue_slice_assoc_array", "del_dl_array",
+              "SLICE_CTRL_SM_V0_ADD", "SLICE_CTRL_SM_V0_DEL", "SLICE_CTRL_SM_V0_UE_SLICE_ASSOC",
+              "SLICE_ALG_SM_V0_STATIC", "SLICE_ALG_SM_V0_NVS",
+              "SLICE_SM_NVS_V0_RATE", "SLICE_SM_NVS_V0_CAPACITY"]
+    for n in needed:
+        print(f"  {'OK     ' if hasattr(ric, n) else 'MISSING'} ric.{n}")
+    print("\nAll SLICE*/slice* names exposed by the SDK:")
+    for n in sorted(x for x in dir(ric) if "slice" in x.lower()):
+        print("  ", n)
+
 
 def main():
-    """Main entry point for the xApp."""
-    import argparse
+    ap = argparse.ArgumentParser(description="Slice Isolation xApp")
+    ap.add_argument("--duration", type=int, default=DEFAULT_MEASUREMENT_DURATION)
+    ap.add_argument("--scenarios", nargs="+", choices=[s.value for s in Scenario],
+                    default=[s.value for s in Scenario])
+    ap.add_argument("--log-dir", default="/tmp/xapp_logs")
+    ap.add_argument("--probe", action="store_true", help="check SDK names and exit")
+    args, rest = ap.parse_known_args()   # rest (-c, -p ...) goes to ric.init()
 
-    parser = argparse.ArgumentParser(description="Slice Isolation xApp")
-    parser.add_argument("--duration", type=int, default=DEFAULT_MEASUREMENT_DURATION,
-                        help=f"Measurement duration per scenario (default: {DEFAULT_MEASUREMENT_DURATION}s)")
-    parser.add_argument("--scenarios", nargs="+",
-                        choices=[s.value for s in Scenario],
-                        default=[s.value for s in [Scenario.STATIC_BALANCED,
-                                                    Scenario.STATIC_UNBALANCED,
-                                                    Scenario.NVS_RATE_BALANCED,
-                                                    Scenario.NVS_RATE_UNBALANCED]],
-                        help="Scenarios to run")
-    parser.add_argument("--log-dir", type=str, default="/tmp/xapp_logs",
-                        help="Log directory")
-    parser.add_argument("--name", type=str, default="xapp_slice_isolation",
-                        help="xApp name")
+    ric = load_sdk()
+    if args.probe:
+        probe(ric)
+        return
 
-    args = parser.parse_args()
+    logger = LoggingManager(args.log_dir)
+    adapter = FlexRICAdapter(ric, logger, [sys.argv[0]] + rest)
+    logger.info(f"E2 node connected (id={adapter.node_id}); scenarios={args.scenarios}")
+    adapter.subscribe()
+    time.sleep(2)  # let first indications arrive
 
-    # Parse scenarios
-    scenarios = [Scenario(s) for s in args.scenarios]
-
-    # Create and run xApp
-    xapp = SliceIsolationXApp(
-        name=args.name,
-        measurement_duration=args.duration,
-        scenarios=scenarios,
-        log_dir=args.log_dir
-    )
-
+    xapp = SliceIsolationXApp(adapter, logger, args.duration, [Scenario(s) for s in args.scenarios])
     try:
-        # In real FlexRIC: xapp.run() starts the event loop
-        # For now, run scenarios directly
-        xapp.run_all_scenarios()
+        xapp.run_all()
     except KeyboardInterrupt:
-        xapp.logging.info("Interrupted by user")
-    except Exception as e:
-        xapp.logging.error(f"Fatal error: {e}", exc=e)
+        logger.info("Interrupted: cleaning up")
+        xapp.running = False
+        xapp._cleanup()
     finally:
-        xapp.stop()
+        adapter.shutdown()
 
 
 if __name__ == "__main__":
