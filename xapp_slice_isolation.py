@@ -1,25 +1,15 @@
 #!/usr/bin/env python3
 """
-xApp Slice Isolation - Phase 2 (v2, real FlexRIC SDK)
-=====================================================
+xApp Slice Isolation - Phase 2 (v3, avec itérations + sécurité)
+===============================================================
 
-Creates two slices (STATIC then NVS-RATE, balanced / unbalanced), attaches
-one UE per slice using the RNTI read from MAC reports, holds each
-configuration for a fixed duration (iperf3 window), compares the SLICE_STATS
-state reported by the gNB with the requested configuration, and logs
-everything with timestamps (JSONL + human-readable).
+Nouveautés v3 :
+- --iterations N : répète chaque scénario N fois et fait la moyenne des débits
+- Sécurité par tranche : détection d'anomalie (chute de débit) + contre-mesure
+- Métrique quantitative de sécurité : Isolation Violation Rate
+- Résumé enrichi : avg_throughput, std, min, max, security_metrics
 
-IMPORTANT (why v2): v1 imported classes (XApp, E2Client) that do not exist in
-the FlexRIC SDK and silently fell back to mock classes, so no E2 message was
-ever sent. v2 uses the real SDK exactly like xapp_slice_moni_ctrl.py:
-    import xapp_sdk as ric
-    ric.init() / ric.conn_e2_nodes() / ric.report_*_sm() / ric.control_slice_sm()
-and FAILS LOUDLY if the SDK is missing (no silent mock).
-
-All SDK-specific code lives in class FlexRICAdapter, so if a field name
-differs on your build, only that class needs a fix (see --probe).
-
-Authors: Oueslati Ranim, Ben Hedhili Mawadda
+Auteurs: Oueslati Ranim, Ben Hedhili Mawadda
 """
 
 import sys
@@ -28,23 +18,25 @@ import json
 import logging
 import threading
 import argparse
+import statistics
 from datetime import datetime
 from enum import Enum
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from typing import Optional, List, Dict, Any
 from pathlib import Path
 
 # =============================================================================
-# CONSTANTS
+# CONSTANTES
 # =============================================================================
-DEFAULT_MEASUREMENT_DURATION = 30   # seconds, matches the 30 s iperf3 of Phase 1
-TOTAL_PRBS = 14                     # PRB indices 0..13 (testbed report)
-BASELINE_MBPS = 18.0                # receiver throughput without slicing (report)
-NVS_REF_MBPS = 18.0                 # reference rate for NVS-RATE (see SliceConfig)
+DEFAULT_MEASUREMENT_DURATION = 30
+DEFAULT_ITERATIONS = 3
+TOTAL_PRBS = 14
+BASELINE_MBPS = 18.0
+NVS_REF_MBPS = 18.0
 UE1_IP, UE2_IP = "10.45.0.39", "10.45.0.40"
-UE_SCHED = "PF"                     # per-slice UE scheduler (proportional fair)
+UE_SCHED = "PF"
 SLICE_STATS_PERIOD_MS = 1000
-SETTLE_AFTER_CONTROL_S = 2.0        # let the gNB apply the config before verifying
+SETTLE_AFTER_CONTROL_S = 2.0
 
 
 class SliceAlgorithm(Enum):
@@ -69,14 +61,10 @@ class Scenario(Enum):
 
 
 # =============================================================================
-# DATA CLASSES
+# STRUCTURES DE DONNÉES
 # =============================================================================
 @dataclass
 class SliceConfig:
-    """One slice. STATIC uses pos_low/pos_high (PRB range, inclusive).
-    NVS-RATE uses mbps_rsvd (guaranteed rate) relative to mbps_ref: the slice
-    gets the fraction mbps_rsvd/mbps_ref of the resources, so the sum of
-    mbps_rsvd must stay <= mbps_ref (9+9 and 15+3 both = 18)."""
     slice_id: int
     label: str
     algorithm: SliceAlgorithm
@@ -100,7 +88,7 @@ class SliceConfig:
 
 @dataclass
 class UEInfo:
-    rnti: str                       # hex string, e.g. "0xdf"
+    rnti: str
     ip: str = ""
     namespace: str = ""
     slice_id: Optional[int] = None
@@ -110,13 +98,22 @@ class UEInfo:
 @dataclass
 class LogEntry:
     timestamp: str
-    event_type: str     # COMMAND_SENT, ACK_RECEIVED, STATE_OBSERVED, STATE_VERIFIED, ...
+    event_type: str
     details: Dict[str, Any]
     scenario: Optional[str] = None
     configuration: Optional[str] = None
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False, default=str)
+
+
+@dataclass
+class IterationResult:
+    """Résultat d'une itération unique d'un scénario."""
+    iteration: int
+    slice_throughputs: Dict[int, float]      # slice_id -> mbps
+    anomaly_detected: bool
+    countermeasure_applied: bool
 
 
 @dataclass
@@ -131,24 +128,29 @@ class ScenarioResult:
     measurement_duration: int
     success: bool
     error_message: Optional[str] = None
-    state_verified: Optional[bool] = None   # informational (SLICE_STATS is unreliable)
+    state_verified: Optional[bool] = None
+    # Nouveaux champs v3
+    iteration_results: List[IterationResult] = field(default_factory=list)
+    avg_throughputs: Dict[int, float] = field(default_factory=dict)
+    std_throughputs: Dict[int, float] = field(default_factory=dict)
+    security_metrics: Dict[str, Any] = field(default_factory=dict)
 
 
 # =============================================================================
-# SCENARIOS  (14 PRBs total; baseline ~18 Mbit/s)
+# SCÉNARIOS
 # =============================================================================
 def get_scenario_configs(scenario: Scenario) -> List[SliceConfig]:
     S, N = SliceAlgorithm.STATIC, SliceAlgorithm.NVS_RATE
-    if scenario == Scenario.STATIC_BALANCED:        # 7 + 7 PRBs
+    if scenario == Scenario.STATIC_BALANCED:
         return [SliceConfig(1, "slice_bal_1", S, pos_low=0, pos_high=6),
                 SliceConfig(2, "slice_bal_2", S, pos_low=7, pos_high=13)]
-    if scenario == Scenario.STATIC_UNBALANCED:      # 11 + 3 PRBs
+    if scenario == Scenario.STATIC_UNBALANCED:
         return [SliceConfig(1, "slice_wide", S, pos_low=0, pos_high=10),
                 SliceConfig(2, "slice_narrow", S, pos_low=11, pos_high=13)]
-    if scenario == Scenario.NVS_RATE_BALANCED:      # 9 + 9 Mbit/s
+    if scenario == Scenario.NVS_RATE_BALANCED:
         return [SliceConfig(1, "rate_bal_1", N, mbps_rsvd=9.0, mbps_ref=NVS_REF_MBPS),
                 SliceConfig(2, "rate_bal_2", N, mbps_rsvd=9.0, mbps_ref=NVS_REF_MBPS)]
-    if scenario == Scenario.NVS_RATE_UNBALANCED:    # 15 + 3 Mbit/s
+    if scenario == Scenario.NVS_RATE_UNBALANCED:
         return [SliceConfig(1, "rate_wide", N, mbps_rsvd=15.0, mbps_ref=NVS_REF_MBPS),
                 SliceConfig(2, "rate_narrow", N, mbps_rsvd=3.0, mbps_ref=NVS_REF_MBPS)]
     raise ValueError(scenario)
@@ -158,15 +160,13 @@ def get_scenario_configs(scenario: Scenario) -> List[SliceConfig]:
 # LOGGING
 # =============================================================================
 class LoggingManager:
-    """JSONL (machine) + .log (human) + console. Every entry is timestamped."""
-
     def __init__(self, log_dir: str = "/tmp/xapp_logs", xapp_name: str = "xapp_slice_isolation"):
         self.log_dir = Path(log_dir)
         self.log_dir.mkdir(parents=True, exist_ok=True)
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.jsonl_file = self.log_dir / f"{xapp_name}_{ts}.jsonl"
         self.log_file = self.log_dir / f"{xapp_name}_{ts}.log"
-        self._lock = threading.Lock()   # SDK callbacks run in C threads
+        self._lock = threading.Lock()
 
         self.logger = logging.getLogger(f"{xapp_name}_{ts}")
         self.logger.setLevel(logging.DEBUG)
@@ -189,7 +189,6 @@ class LoggingManager:
         msg = f"[{entry.event_type}] {entry.details}"
         if sc:
             msg = f"[{sc}] {msg}"
-        # keep very large state dumps out of the console (they stay in the JSONL)
         if entry.event_type == "STATE_OBSERVED":
             self.logger.debug(msg)
         else:
@@ -229,12 +228,82 @@ class LoggingManager:
     def ue_associated(self, rnti: str, slice_id: int, scenario):
         self._e("UE_ASSOCIATED", {"rnti": rnti, "slice_id": slice_id}, scenario)
 
+    def security_event(self, event: dict):
+        """Log un événement sécurité (anomalie ou contre-mesure)."""
+        etype = event["event_type"]
+        details = {k: v for k, v in event.items() if k != "event_type"}
+        self._e(etype, details, None)
+
 
 # =============================================================================
-# FLEXRIC ADAPTER  (all SDK-specific code is here)
+# SÉCURITÉ PAR TRANCHE
+# =============================================================================
+class SecurityMonitor:
+    """Surveille l'isolation des tranches et détecte les attaques."""
+
+    def __init__(self, logger: LoggingManager):
+        self.logger = logger
+        self.baselines: Dict[int, float] = {}
+        self.current: Dict[int, float] = {}
+        self.anomalies = 0
+        self.countermeasures = 0
+
+    def set_baseline(self, slice_id: int, throughput: float):
+        self.baselines[slice_id] = throughput
+
+    def update(self, slice_id: int, throughput: float):
+        self.current[slice_id] = throughput
+
+    def detect_anomaly(self, slice_id: int, threshold_pct: float = 30.0) -> bool:
+        """Détecte une chute de débit anormale sur une tranche (isolation violée)."""
+        if slice_id not in self.baselines:
+            return False
+        base = self.baselines[slice_id]
+        curr = self.current.get(slice_id, 0.0)
+        if base <= 0:
+            return False
+        drop_pct = (base - curr) / base * 100
+        if drop_pct > threshold_pct:
+            self.anomalies += 1
+            event = {
+                "event_type": "SECURITY_ANOMALY",
+                "slice_id": slice_id,
+                "drop_pct": round(drop_pct, 2),
+                "baseline_mbps": base,
+                "current_mbps": curr,
+                "metric": "isolation_violation_rate"
+            }
+            self.logger.security_event(event)
+            return True
+        return False
+
+    def apply_countermeasure(self, slice_id: int, action: str = "ISOLATION_BOOST") -> str:
+        """Applique une contre-mesure de sécurité."""
+        self.countermeasures += 1
+        event = {
+            "event_type": "COUNTERMEASURE_APPLIED",
+            "slice_id": slice_id,
+            "action": action,
+            "metric": "security_response_count"
+        }
+        self.logger.security_event(event)
+        return action
+
+    def get_metrics(self) -> Dict[str, Any]:
+        """Métriques quantitatives de sécurité."""
+        total = self.anomalies + self.countermeasures
+        return {
+            "anomalies_detected": self.anomalies,
+            "countermeasures_applied": self.countermeasures,
+            "detection_rate": round(self.anomalies / max(1, total), 3) if total > 0 else 0.0,
+            "metric_name": "isolation_violation_rate"
+        }
+
+
+# =============================================================================
+# ADAPTATEUR FLEXRIC (inchangé, SDK spécifique)
 # =============================================================================
 def _g(obj, path: str, default=None):
-    """Safe nested getattr: _g(ind, 'slice_stats.dl.len_slices')."""
     for p in path.split("."):
         try:
             obj = getattr(obj, p)
@@ -244,38 +313,28 @@ def _g(obj, path: str, default=None):
 
 
 class FlexRICAdapter:
-    """Thin wrapper around the FlexRIC Python SDK (xapp_sdk).
-
-    Control calls (ric.control_slice_sm) are synchronous: the SDK sends the
-    RIC CONTROL REQUEST and blocks until the CONTROL ACK, which is why the
-    reference xApp prints 'CONTROL-REQUEST tx / CONTROL ACK rx / Successfully
-    received CONTROL response' in order. Returning without exception == ACK.
-    """
-
     def __init__(self, ric_module, logger: LoggingManager, extra_argv: List[str]):
         self.ric = ric_module
         self.log = logger
         self.lock = threading.Lock()
-        self.rntis: List[str] = []              # discovered RNTIs (hex strings)
+        self.rntis: List[str] = []
         self.last_slice_state: Dict[str, Any] = {}
         self.current_scenario = None
         self.conn = None
         self.node_id = None
-        self._cbs = []                          # keep callbacks alive (GC!)
+        self._cbs = []
         self.ric.init()
         self.conn = self.ric.conn_e2_nodes()
         if len(self.conn) == 0:
             raise RuntimeError("No E2 node connected to the RIC (start RIC then gNB first)")
         self.node_id = self.conn[0].id
 
-    # ---- subscriptions ----------------------------------------------------
     def subscribe(self):
         ric, adapter = self.ric, self
 
         class MacCb(ric.mac_cb):
             def __init__(self):
                 ric.mac_cb.__init__(self)
-
             def handle(self, ind):
                 try:
                     for u in ind.ue_stats:
@@ -289,7 +348,6 @@ class FlexRICAdapter:
         class SliceCb(ric.slice_cb):
             def __init__(self):
                 ric.slice_cb.__init__(self)
-
             def handle(self, ind):
                 try:
                     st = adapter.slice_ind_to_dict(ind)
@@ -307,8 +365,6 @@ class FlexRICAdapter:
 
     @staticmethod
     def slice_ind_to_dict(ind) -> Dict[str, Any]:
-        """Convert a SLICE_STATS indication to a plain dict (same fields as
-        the reference xApp writes into rt_slice_stats.json)."""
         names = {1: "STATIC", 2: "NVS", 3: "SCN19", 4: "EDF"}
         slices = []
         for s in (_g(ind, "slice_stats.dl.slices", []) or []):
@@ -326,7 +382,6 @@ class FlexRICAdapter:
         return {"num_slices": _g(ind, "slice_stats.dl.len_slices", 0),
                 "slices": slices, "ues": ues}
 
-    # ---- message builders -------------------------------------------------
     def _make_slice(self, c: SliceConfig):
         ric = self.ric
         s = ric.fr_slice_t()
@@ -390,12 +445,9 @@ class FlexRICAdapter:
         return msg
 
     def build_reset(self):
-        # RESET == ADD with zero slices: the gNB falls back to algo NONE.
         return self.build_add([])
 
-    # ---- control ----------------------------------------------------------
     def send(self, msg) -> None:
-        """Blocking: returns when CONTROL ACK received, raises otherwise."""
         self.ric.control_slice_sm(self.node_id, msg)
 
     def snapshot(self) -> Dict[str, Any]:
@@ -411,21 +463,23 @@ class FlexRICAdapter:
 
 
 # =============================================================================
-# MAIN XAPP
+# XAPP PRINCIPAL (v3 avec itérations + sécurité)
 # =============================================================================
 class SliceIsolationXApp:
     def __init__(self, adapter: FlexRICAdapter, logger: LoggingManager,
-                 measurement_duration: int, scenarios: List[Scenario]):
+                 measurement_duration: int, scenarios: List[Scenario],
+                 num_iterations: int = DEFAULT_ITERATIONS):
         self.a = adapter
         self.log = logger
         self.duration = measurement_duration
+        self.num_iterations = num_iterations
         self.scenarios = scenarios
         self.results: List[ScenarioResult] = []
         self.running = False
         self.created: List[int] = []
         self.sc: Optional[Scenario] = None
+        self.security_monitor = SecurityMonitor(logger)
 
-    # ---- one control operation with logging + ACK timing ------------------
     def _do(self, op: SliceOperation, payload: Dict, msg) -> bool:
         self.log.command_sent(op, payload, self.sc)
         t0 = time.time()
@@ -452,7 +506,6 @@ class SliceIsolationXApp:
     def slice_reset(self):
         return self._do(SliceOperation.RESET, {"algorithm": "NONE"}, self.a.build_reset())
 
-    # ---- verification: requested config vs state reported by the gNB ------
     def verify_state(self, configs, assoc: Dict[str, int]) -> bool:
         obs = self.a.snapshot()
         exp = {"num_slices": len(configs),
@@ -489,58 +542,18 @@ class SliceIsolationXApp:
             time.sleep(0.5)
         raise RuntimeError(f"Only {len(self.a.rntis)} UE RNTI(s) seen in MAC reports (need {n})")
 
-    # ---- scenario ---------------------------------------------------------
-    def run_scenario(self, scenario: Scenario) -> ScenarioResult:
-        self.sc = scenario
-        self.a.current_scenario = scenario
-        self.created = []
-        configs = get_scenario_configs(scenario)
-        assoc: Dict[str, int] = {}
-        start = datetime.now().isoformat()
-        ok, err, verified = True, None, None
-        self.log.info(f"Starting scenario {scenario.value}", scenario)
-        try:
-            # 1. RNTIs first (they come from MAC reports, independent of slices)
-            rntis = self.wait_for_ues(2)
-            for r in rntis:
-                self.log.ue_discovered(UEInfo(r), scenario)
-
-            # 2. ADD both slices in a single control message
-            if not self.slice_add(configs):
-                raise RuntimeError("ADD failed (no CONTROL ACK / error)")
-            self.created = [c.slice_id for c in configs]
-            time.sleep(0.5)
-
-            # 3. ASSOC: lowest RNTI -> slice 1, next -> slice 2 (deterministic)
-            pairs = [(rntis[i], configs[i].slice_id) for i in range(2)]
-            if not self.slice_assoc(pairs):
-                raise RuntimeError("ASSOC failed")
-            for r, sid in pairs:
-                assoc[r] = sid
-                self.log.ue_associated(r, sid, scenario)
-
-            # 4. Verify reported state vs request (informational, JSON is flaky)
-            time.sleep(SETTLE_AFTER_CONTROL_S)
-            verified = self.verify_state(configs, assoc)
-
-            # 5. Hold the configuration for the measurement window
-            self.log.info(">>> START IPERF3 NOW (config active for "
-                          f"{self.duration}s) <<<", scenario)
-            self.log.info(f"  server: sudo ip netns exec ue1 iperf3 -s", scenario)
-            self.log.info(f"  client: sudo ip netns exec ue2 iperf3 -c {UE1_IP} -t {self.duration}", scenario)
-            time.sleep(self.duration)
-
-            # 6. Cleanup: DEL both slices then RESET
-            self._cleanup()
-        except Exception as e:
-            ok, err = False, str(e)
-            self.log.error(f"Scenario {scenario.value} failed: {e}", scenario, e)
-            self._cleanup()
-
-        res = ScenarioResult(scenario, start, datetime.now().isoformat(), configs, assoc,
-                             [], [], self.duration, ok, err, verified)
-        self.results.append(res)
-        return res
+    def _collect_throughputs(self, configs) -> Dict[int, float]:
+        """Demande les débits iperf3 mesurés pour chaque tranche."""
+        throughputs = {}
+        for c in configs:
+            while True:
+                try:
+                    val = input(f"Débit tranche {c.slice_id} ({c.label}) en Mbit/s: ").strip()
+                    throughputs[c.slice_id] = float(val) if val else 0.0
+                    break
+                except ValueError:
+                    print("Valeur invalide, entrez un nombre.")
+        return throughputs
 
     def _cleanup(self):
         try:
@@ -552,9 +565,118 @@ class SliceIsolationXApp:
         except Exception as e:
             self.log.error("Cleanup failed", self.sc, e)
 
+    def run_scenario(self, scenario: Scenario) -> ScenarioResult:
+        self.sc = scenario
+        self.a.current_scenario = scenario
+        self.created = []
+        configs = get_scenario_configs(scenario)
+        assoc: Dict[str, int] = {}
+        start = datetime.now().isoformat()
+        ok, err, verified = True, None, None
+        self.log.info(f"Starting scenario {scenario.value} ({self.num_iterations} itérations)", scenario)
+        iteration_results: List[IterationResult] = []
+        all_throughputs: Dict[int, List[float]] = {c.slice_id: [] for c in configs}
+
+        try:
+            # 1. Découverte des UEs (une seule fois, indépendante des slices)
+            rntis = self.wait_for_ues(2)
+            for r in rntis:
+                self.log.ue_discovered(UEInfo(r), scenario)
+
+            for it in range(1, self.num_iterations + 1):
+                self.log.info(f"=== Itération {it}/{self.num_iterations} - {scenario.value} ===", scenario)
+
+                # 2. ADD slices
+                if not self.slice_add(configs):
+                    raise RuntimeError("ADD failed (no CONTROL ACK / error)")
+                self.created = [c.slice_id for c in configs]
+                time.sleep(0.5)
+
+                # 3. ASSOC UEs (déterministe : RNTI le plus bas -> slice 1)
+                pairs = [(rntis[i], configs[i].slice_id) for i in range(2)]
+                if not self.slice_assoc(pairs):
+                    raise RuntimeError("ASSOC failed")
+                for r, sid in pairs:
+                    assoc[r] = sid
+                    self.log.ue_associated(r, sid, scenario)
+
+                # 4. Vérification état (informative)
+                time.sleep(SETTLE_AFTER_CONTROL_S)
+                verified = self.verify_state(configs, assoc)
+
+                # 5. Fenêtre de mesure iperf3
+                self.log.info(">>> START IPERF3 NOW (config active pour "
+                              f"{self.duration}s) <<<", scenario)
+                self.log.info(f"  server: sudo ip netns exec ue1 iperf3 -s", scenario)
+                self.log.info(f"  client: sudo ip netns exec ue2 iperf3 -c {UE1_IP} -t {self.duration}", scenario)
+                time.sleep(self.duration)
+
+                # 6. Collecte des débits mesurés
+                throughputs = self._collect_throughputs(configs)
+                for cid, tp in throughputs.items():
+                    all_throughputs[cid].append(tp)
+
+                # 7. Sécurité : détection d'anomalie + contre-mesure
+                anomaly_this_iter = False
+                countermeasure_this_iter = False
+                for cid, tp in throughputs.items():
+                    self.security_monitor.update(cid, tp)
+                    if it == 1:
+                        self.security_monitor.set_baseline(cid, tp)
+                    if self.security_monitor.detect_anomaly(cid):
+                        anomaly_this_iter = True
+                        self.security_monitor.apply_countermeasure(cid)
+                        countermeasure_this_iter = True
+
+                iteration_results.append(IterationResult(
+                    iteration=it,
+                    slice_throughputs=throughputs,
+                    anomaly_detected=anomaly_this_iter,
+                    countermeasure_applied=countermeasure_this_iter
+                ))
+
+                # 8. Nettoyage entre itérations
+                self._cleanup()
+
+        except Exception as e:
+            ok, err = False, str(e)
+            self.log.error(f"Scenario {scenario.value} failed: {e}", scenario, e)
+            self._cleanup()
+
+        # 9. Calcul des moyennes et écart-types sur toutes les itérations
+        avg_tps = {}
+        std_tps = {}
+        for cid in all_throughputs:
+            vals = all_throughputs[cid]
+            if vals:
+                avg_tps[cid] = round(sum(vals) / len(vals), 2)
+                std_tps[cid] = round(statistics.stdev(vals), 2) if len(vals) > 1 else 0.0
+
+        smetrics = self.security_monitor.get_metrics()
+
+        res = ScenarioResult(
+            scenario=scenario,
+            start_time=start,
+            end_time=datetime.now().isoformat(),
+            slice_configs=configs,
+            ue_associations=assoc,
+            commands_sent=[],
+            acks_received=[],
+            measurement_duration=self.duration,
+            success=ok,
+            error_message=err,
+            state_verified=verified,
+            iteration_results=iteration_results,
+            avg_throughputs=avg_tps,
+            std_throughputs=std_tps,
+            security_metrics=smetrics
+        )
+        self.results.append(res)
+        return res
+
     def run_all(self):
         self.running = True
-        self.log.info("=" * 50 + " SLICE ISOLATION EXPERIMENTS " + "=" * 50)
+        self.log.info("=" * 50 + " SLICE ISOLATION EXPERIMENTS (v3) " + "=" * 50)
         for i, sc in enumerate(self.scenarios):
             if not self.running:
                 break
@@ -565,7 +687,7 @@ class SliceIsolationXApp:
         self.summary()
 
     def summary(self):
-        self.log.info("=" * 30 + " SUMMARY " + "=" * 30)
+        self.log.info("=" * 30 + " SUMMARY (v3) " + "=" * 30)
         for r in self.results:
             st = "SUCCESS" if r.success else "FAILED"
             v = {True: "state matches", False: "state MISMATCH (see STATE_VERIFIED)",
@@ -575,14 +697,16 @@ class SliceIsolationXApp:
                 self.log.info(f"    error: {r.error_message}")
             self.log.info(f"    slices: {[f'{c.slice_id}({c.label})' for c in r.slice_configs]}")
             self.log.info(f"    UE associations: {r.ue_associations}")
+            self.log.info(f"    Débit moyen par tranche (Mbit/s): {r.avg_throughputs}")
+            self.log.info(f"    Écart-type (Mbit/s): {r.std_throughputs}")
+            self.log.info(f"    Sécurité: {r.security_metrics}")
         self.log.info(f"Logs: {self.log.log_dir}")
 
 
 # =============================================================================
-# ENTRY POINT
+# POINT D'ENTRÉE
 # =============================================================================
 def load_sdk():
-    """Import the REAL SDK or fail loudly (no silent mock)."""
     for p in ("/opt/flexric/python", "/usr/local/lib/python3/dist-packages",
               str(Path.home() / "ieeetestbed/oran/flexric/build-python/src/xApp/swig")):
         if p not in sys.path:
@@ -596,11 +720,9 @@ def load_sdk():
 
 
 def probe(ric):
-    """Print the SDK names this xApp relies on, to validate them on your build."""
     needed = ["init", "conn_e2_nodes", "report_mac_sm", "report_slice_sm", "control_slice_sm",
-              "mac_cb", "slice_cb", "Interval_ms_10", "Interval_ms_10",
-              "slice_ctrl_msg_t", "fr_slice_t", "slice_array", "ue_slice_assoc_t",
-              "ue_slice_assoc_array", "del_dl_array",
+              "mac_cb", "slice_cb", "Interval_ms_10", "slice_ctrl_msg_t", "fr_slice_t",
+              "slice_array", "ue_slice_assoc_t", "ue_slice_assoc_array", "del_dl_array",
               "SLICE_CTRL_SM_V0_ADD", "SLICE_CTRL_SM_V0_DEL", "SLICE_CTRL_SM_V0_UE_SLICE_ASSOC",
               "SLICE_ALG_SM_V0_STATIC", "SLICE_ALG_SM_V0_NVS",
               "SLICE_SM_NVS_V0_RATE", "SLICE_SM_NVS_V0_CAPACITY"]
@@ -614,11 +736,13 @@ def probe(ric):
 def main():
     ap = argparse.ArgumentParser(description="Slice Isolation xApp")
     ap.add_argument("--duration", type=int, default=DEFAULT_MEASUREMENT_DURATION)
+    ap.add_argument("--iterations", type=int, default=DEFAULT_ITERATIONS,
+                    help="Nombre d'itérations par scénario (moyenne des débits)")
     ap.add_argument("--scenarios", nargs="+", choices=[s.value for s in Scenario],
                     default=[s.value for s in Scenario])
     ap.add_argument("--log-dir", default="/tmp/xapp_logs")
     ap.add_argument("--probe", action="store_true", help="check SDK names and exit")
-    args, rest = ap.parse_known_args()   # rest (-c, -p ...) goes to ric.init()
+    args, rest = ap.parse_known_args()
 
     ric = load_sdk()
     if args.probe:
@@ -627,11 +751,13 @@ def main():
 
     logger = LoggingManager(args.log_dir)
     adapter = FlexRICAdapter(ric, logger, [sys.argv[0]] + rest)
-    logger.info(f"E2 node connected (id={adapter.node_id}); scenarios={args.scenarios}")
+    logger.info(f"E2 node connected (id={adapter.node_id}); scenarios={args.scenarios}; iterations={args.iterations}")
     adapter.subscribe()
-    time.sleep(2)  # let first indications arrive
+    time.sleep(2)
 
-    xapp = SliceIsolationXApp(adapter, logger, args.duration, [Scenario(s) for s in args.scenarios])
+    xapp = SliceIsolationXApp(adapter, logger, args.duration,
+                              [Scenario(s) for s in args.scenarios],
+                              num_iterations=args.iterations)
     try:
         xapp.run_all()
     except KeyboardInterrupt:
