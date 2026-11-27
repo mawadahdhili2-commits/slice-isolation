@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
-xApp Slice Isolation - Phase 2 (v3, avec itérations + sécurité)
-===============================================================
+xApp Slice Isolation - Phase 2 (v4, avec IA intégrée : Isolation Forest)
+=========================================================================
 
-Nouveautés v3 :
-- --iterations N : répète chaque scénario N fois et fait la moyenne des débits
-- Sécurité par tranche : détection d'anomalie (chute de débit) + contre-mesure
-- Métrique quantitative de sécurité : Isolation Violation Rate
-- Résumé enrichi : avg_throughput, std, min, max, security_metrics
+Nouveautés v4 :
+- Itérations multiples avec moyenne des débits et écart-type
+- Sécurité par tranche : détection d'anomalie + contre-mesure automatique
+- Agent autonome IA : détection par Isolation Forest (scikit-learn, non supervisé)
+- Métriques quantitatives de sécurité : Isolation Violation Rate, IA actions
+- Entraînement du modèle IA sur trafic normal avant détection
 
 Auteurs: Oueslati Ranim, Ben Hedhili Mawadda
 """
@@ -24,6 +25,13 @@ from enum import Enum
 from dataclasses import dataclass, asdict, field
 from typing import Optional, List, Dict, Any
 from pathlib import Path
+
+try:
+    import numpy as np
+    from sklearn.ensemble import IsolationForest
+    SKLEARN_AVAILABLE = True
+except ImportError:
+    SKLEARN_AVAILABLE = False
 
 # =============================================================================
 # CONSTANTES
@@ -109,9 +117,8 @@ class LogEntry:
 
 @dataclass
 class IterationResult:
-    """Résultat d'une itération unique d'un scénario."""
     iteration: int
-    slice_throughputs: Dict[int, float]      # slice_id -> mbps
+    slice_throughputs: Dict[int, float]
     anomaly_detected: bool
     countermeasure_applied: bool
 
@@ -129,7 +136,6 @@ class ScenarioResult:
     success: bool
     error_message: Optional[str] = None
     state_verified: Optional[bool] = None
-    # Nouveaux champs v3
     iteration_results: List[IterationResult] = field(default_factory=list)
     avg_throughputs: Dict[int, float] = field(default_factory=dict)
     std_throughputs: Dict[int, float] = field(default_factory=dict)
@@ -229,18 +235,15 @@ class LoggingManager:
         self._e("UE_ASSOCIATED", {"rnti": rnti, "slice_id": slice_id}, scenario)
 
     def security_event(self, event: dict):
-        """Log un événement sécurité (anomalie ou contre-mesure)."""
         etype = event["event_type"]
         details = {k: v for k, v in event.items() if k != "event_type"}
         self._e(etype, details, None)
 
 
 # =============================================================================
-# SÉCURITÉ PAR TRANCHE
+# SÉCURITÉ PAR TRANCHE + IA
 # =============================================================================
 class SecurityMonitor:
-    """Surveille l'isolation des tranches et détecte les attaques."""
-
     def __init__(self, logger: LoggingManager):
         self.logger = logger
         self.baselines: Dict[int, float] = {}
@@ -255,7 +258,6 @@ class SecurityMonitor:
         self.current[slice_id] = throughput
 
     def detect_anomaly(self, slice_id: int, threshold_pct: float = 30.0) -> bool:
-        """Détecte une chute de débit anormale sur une tranche (isolation violée)."""
         if slice_id not in self.baselines:
             return False
         base = self.baselines[slice_id]
@@ -278,7 +280,6 @@ class SecurityMonitor:
         return False
 
     def apply_countermeasure(self, slice_id: int, action: str = "ISOLATION_BOOST") -> str:
-        """Applique une contre-mesure de sécurité."""
         self.countermeasures += 1
         event = {
             "event_type": "COUNTERMEASURE_APPLIED",
@@ -290,7 +291,6 @@ class SecurityMonitor:
         return action
 
     def get_metrics(self) -> Dict[str, Any]:
-        """Métriques quantitatives de sécurité."""
         total = self.anomalies + self.countermeasures
         return {
             "anomalies_detected": self.anomalies,
@@ -300,8 +300,95 @@ class SecurityMonitor:
         }
 
 
+class AnomalyDetectorAI:
+    """Détecteur d'anomalie basé sur Isolation Forest (apprentissage non supervisé, scikit-learn)."""
+    
+    def __init__(self, logger: LoggingManager, contamination: float = 0.1):
+        self.logger = logger
+        self.model = IsolationForest(contamination=contamination, random_state=42)
+        self.is_trained = False
+        self.feature_names = ["throughput_mbps", "prb_allocated", "latency_ms"]
+    
+    def extract_features(self, slice_id: int, throughput: float, 
+                         prb_allocated: int, latency_ms: float) -> List[float]:
+        return [throughput, float(prb_allocated), float(latency_ms)]
+    
+    def train(self, features: List[List[float]]):
+        if not SKLEARN_AVAILABLE:
+            self.logger.error("scikit-learn non installé. Installez avec: pip install scikit-learn --break-system-packages", None)
+            return
+        if len(features) < 5:
+            self.logger.error("Pas assez de données pour entraîner l'IA (minimum 5 échantillons)", None)
+            return
+        self.model.fit(np.array(features))
+        self.is_trained = True
+        self.logger.info(f"IA (Isolation Forest) entraînée sur {len(features)} échantillons normaux", None)
+    
+    def predict(self, features: List[float]) -> tuple:
+        if not self.is_trained:
+            return False, 0.0
+        prediction = self.model.predict(np.array([features]))[0]
+        score = self.model.decision_function(np.array([features]))[0]
+        return prediction == -1, float(score)
+
+
+class AutonomousAgent:
+    def __init__(self, logger: LoggingManager, security_monitor: SecurityMonitor,
+                 anomaly_detector: Any, xapp: 'SliceIsolationXApp',
+                 ia_detector: AnomalyDetectorAI):
+        self.logger = logger
+        self.security_monitor = security_monitor
+        self.anomaly_detector = anomaly_detector
+        self.ia_detector = ia_detector
+        self.xapp = xapp
+        self.actions_taken = 0
+
+    def evaluate_and_act(self, slice_id: int, throughput: float, 
+                         baseline: float, prb_allocated: int, latency_ms: float):
+        rule_anomaly = self.anomaly_detector.detect(slice_id)
+        
+        features = self.ia_detector.extract_features(slice_id, throughput, prb_allocated, latency_ms)
+        ia_anomaly, ia_score = self.ia_detector.predict(features)
+        
+        if rule_anomaly or ia_anomaly:
+            self.security_monitor.anomalies += 1
+            action = self._choose_countermeasure(slice_id, throughput, baseline)
+            self.security_monitor.apply_countermeasure(slice_id, action)
+            self.actions_taken += 1
+            
+            event = {
+                "event_type": "AI_ANOMALY_DETECTED",
+                "slice_id": slice_id,
+                "ia_score": round(ia_score, 4),
+                "rule_triggered": rule_anomaly,
+                "ia_triggered": ia_anomaly,
+                "throughput_mbps": throughput,
+                "prb_allocated": prb_allocated,
+                "latency_ms": latency_ms,
+                "metric": "ai_anomaly_detection"
+            }
+            self.logger.security_event(event)
+            return action
+        return None
+
+    def _choose_countermeasure(self, slice_id: int, throughput: float, baseline: float) -> str:
+        drop_pct = (baseline - throughput) / baseline * 100 if baseline > 0 else 0
+        if drop_pct > 50:
+            return "ISOLATION_BOOST"
+        elif drop_pct > 30:
+            return "RATE_LIMIT"
+        else:
+            return "MONITOR_ONLY"
+
+    def get_metrics(self) -> Dict:
+        return {
+            "ai_actions_taken": self.actions_taken,
+            "metric_name": "autonomous_agent_actions"
+        }
+
+
 # =============================================================================
-# ADAPTATEUR FLEXRIC (inchangé, SDK spécifique)
+# ADAPTATEUR FLEXRIC
 # =============================================================================
 def _g(obj, path: str, default=None):
     for p in path.split("."):
@@ -463,12 +550,13 @@ class FlexRICAdapter:
 
 
 # =============================================================================
-# XAPP PRINCIPAL (v3 avec itérations + sécurité)
+# XAPP PRINCIPAL (v4 avec itérations + sécurité + IA autonome)
 # =============================================================================
 class SliceIsolationXApp:
     def __init__(self, adapter: FlexRICAdapter, logger: LoggingManager,
                  measurement_duration: int, scenarios: List[Scenario],
-                 num_iterations: int = DEFAULT_ITERATIONS):
+                 num_iterations: int = DEFAULT_ITERATIONS,
+                 ia_detector: AnomalyDetectorAI = None):
         self.a = adapter
         self.log = logger
         self.duration = measurement_duration
@@ -479,6 +567,11 @@ class SliceIsolationXApp:
         self.created: List[int] = []
         self.sc: Optional[Scenario] = None
         self.security_monitor = SecurityMonitor(logger)
+        self.anomaly_detector = AnomalyDetector(logger)
+        self.ia_detector = ia_detector if ia_detector else AnomalyDetectorAI(logger)
+        self.autonomous_agent = AutonomousAgent(logger, self.security_monitor,
+                                                self.anomaly_detector, self,
+                                                self.ia_detector)
 
     def _do(self, op: SliceOperation, payload: Dict, msg) -> bool:
         self.log.command_sent(op, payload, self.sc)
@@ -543,7 +636,6 @@ class SliceIsolationXApp:
         raise RuntimeError(f"Only {len(self.a.rntis)} UE RNTI(s) seen in MAC reports (need {n})")
 
     def _collect_throughputs(self, configs) -> Dict[int, float]:
-        """Demande les débits iperf3 mesurés pour chaque tranche."""
         throughputs = {}
         for c in configs:
             while True:
@@ -554,6 +646,24 @@ class SliceIsolationXApp:
                 except ValueError:
                     print("Valeur invalide, entrez un nombre.")
         return throughputs
+
+    def _collect_training_features(self, configs) -> List[List[float]]:
+        features = []
+        print("\n=== PHASE D'ENTRAÎNEMENT IA (trafic normal, sans attaque) ===")
+        for i in range(5):
+            print(f"\nItération d'entraînement {i+1}/5 :")
+            print("  Mesurez le débit de chaque tranche sans attaque active.")
+            for c in configs:
+                while True:
+                    try:
+                        tp = float(input(f"    Débit tranche {c.slice_id} ({c.label}) en Mbit/s: ") or "14.0")
+                        prb = float(input(f"    PRB alloués tranche {c.slice_id}: ") or "7.0")
+                        lat = float(input(f"    Latence tranche {c.slice_id} (ms): ") or "10.0")
+                        features.append(self.ia_detector.extract_features(c.slice_id, tp, int(prb), lat))
+                        break
+                    except ValueError:
+                        print("    Valeur invalide, entrez un nombre.")
+        return features
 
     def _cleanup(self):
         try:
@@ -578,7 +688,6 @@ class SliceIsolationXApp:
         all_throughputs: Dict[int, List[float]] = {c.slice_id: [] for c in configs}
 
         try:
-            # 1. Découverte des UEs (une seule fois, indépendante des slices)
             rntis = self.wait_for_ues(2)
             for r in rntis:
                 self.log.ue_discovered(UEInfo(r), scenario)
@@ -586,13 +695,11 @@ class SliceIsolationXApp:
             for it in range(1, self.num_iterations + 1):
                 self.log.info(f"=== Itération {it}/{self.num_iterations} - {scenario.value} ===", scenario)
 
-                # 2. ADD slices
                 if not self.slice_add(configs):
                     raise RuntimeError("ADD failed (no CONTROL ACK / error)")
                 self.created = [c.slice_id for c in configs]
                 time.sleep(0.5)
 
-                # 3. ASSOC UEs (déterministe : RNTI le plus bas -> slice 1)
                 pairs = [(rntis[i], configs[i].slice_id) for i in range(2)]
                 if not self.slice_assoc(pairs):
                     raise RuntimeError("ASSOC failed")
@@ -600,23 +707,19 @@ class SliceIsolationXApp:
                     assoc[r] = sid
                     self.log.ue_associated(r, sid, scenario)
 
-                # 4. Vérification état (informative)
                 time.sleep(SETTLE_AFTER_CONTROL_S)
                 verified = self.verify_state(configs, assoc)
 
-                # 5. Fenêtre de mesure iperf3
                 self.log.info(">>> START IPERF3 NOW (config active pour "
                               f"{self.duration}s) <<<", scenario)
                 self.log.info(f"  server: sudo ip netns exec ue1 iperf3 -s", scenario)
                 self.log.info(f"  client: sudo ip netns exec ue2 iperf3 -c {UE1_IP} -t {self.duration}", scenario)
                 time.sleep(self.duration)
 
-                # 6. Collecte des débits mesurés
                 throughputs = self._collect_throughputs(configs)
                 for cid, tp in throughputs.items():
                     all_throughputs[cid].append(tp)
 
-                # 7. Sécurité : détection d'anomalie + contre-mesure
                 anomaly_this_iter = False
                 countermeasure_this_iter = False
                 for cid, tp in throughputs.items():
@@ -627,6 +730,15 @@ class SliceIsolationXApp:
                         anomaly_this_iter = True
                         self.security_monitor.apply_countermeasure(cid)
                         countermeasure_this_iter = True
+                    self.anomaly_detector.update(cid, tp)
+                    ai_action = self.autonomous_agent.evaluate_and_act(
+                        cid, tp,
+                        self.security_monitor.baselines.get(cid, tp),
+                        7,
+                        10.0
+                    )
+                    if ai_action:
+                        countermeasure_this_iter = True
 
                 iteration_results.append(IterationResult(
                     iteration=it,
@@ -635,7 +747,6 @@ class SliceIsolationXApp:
                     countermeasure_applied=countermeasure_this_iter
                 ))
 
-                # 8. Nettoyage entre itérations
                 self._cleanup()
 
         except Exception as e:
@@ -643,7 +754,6 @@ class SliceIsolationXApp:
             self.log.error(f"Scenario {scenario.value} failed: {e}", scenario, e)
             self._cleanup()
 
-        # 9. Calcul des moyennes et écart-types sur toutes les itérations
         avg_tps = {}
         std_tps = {}
         for cid in all_throughputs:
@@ -653,6 +763,7 @@ class SliceIsolationXApp:
                 std_tps[cid] = round(statistics.stdev(vals), 2) if len(vals) > 1 else 0.0
 
         smetrics = self.security_monitor.get_metrics()
+        smetrics.update(self.autonomous_agent.get_metrics())
 
         res = ScenarioResult(
             scenario=scenario,
@@ -676,7 +787,7 @@ class SliceIsolationXApp:
 
     def run_all(self):
         self.running = True
-        self.log.info("=" * 50 + " SLICE ISOLATION EXPERIMENTS (v3) " + "=" * 50)
+        self.log.info("=" * 50 + " SLICE ISOLATION EXPERIMENTS (v4 IA) " + "=" * 50)
         for i, sc in enumerate(self.scenarios):
             if not self.running:
                 break
@@ -687,7 +798,7 @@ class SliceIsolationXApp:
         self.summary()
 
     def summary(self):
-        self.log.info("=" * 30 + " SUMMARY (v3) " + "=" * 30)
+        self.log.info("=" * 30 + " SUMMARY (v4 IA) " + "=" * 30)
         for r in self.results:
             st = "SUCCESS" if r.success else "FAILED"
             v = {True: "state matches", False: "state MISMATCH (see STATE_VERIFIED)",
@@ -699,7 +810,7 @@ class SliceIsolationXApp:
             self.log.info(f"    UE associations: {r.ue_associations}")
             self.log.info(f"    Débit moyen par tranche (Mbit/s): {r.avg_throughputs}")
             self.log.info(f"    Écart-type (Mbit/s): {r.std_throughputs}")
-            self.log.info(f"    Sécurité: {r.security_metrics}")
+            self.log.info(f"    Sécurité + IA: {r.security_metrics}")
         self.log.info(f"Logs: {self.log.log_dir}")
 
 
@@ -755,9 +866,23 @@ def main():
     adapter.subscribe()
     time.sleep(2)
 
+    print("\n" + "="*60)
+    print("PHASE D'ENTRAÎNEMENT IA (Isolation Forest)")
+    print("Mesurez le trafic NORMAL (sans attaque) pour chaque tranche")
+    print("="*60 + "\n")
+    
     xapp = SliceIsolationXApp(adapter, logger, args.duration,
                               [Scenario(s) for s in args.scenarios],
                               num_iterations=args.iterations)
+    
+    configs = get_scenario_configs(args.scenarios[0] if args.scenarios else Scenario.STATIC_BALANCED)
+    training_features = xapp._collect_training_features(configs)
+    xapp.ia_detector.train(training_features)
+    
+    print("\n" + "="*60)
+    print("FIN DE L'ENTRAÎNEMENT IA - Début des expériences")
+    print("="*60 + "\n")
+    
     try:
         xapp.run_all()
     except KeyboardInterrupt:
